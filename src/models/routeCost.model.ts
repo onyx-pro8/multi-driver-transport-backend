@@ -76,6 +76,9 @@ export interface RouteCostSummaryRow {
   updated_at: Date;
 }
 
+export type PffLegPhase = "payment" | "goods";
+export type PffHandoffRole = "payment_delivery" | "goods_pickup";
+
 export interface RouteSegmentCostResponse {
   segment_id: number;
   segment_index: number;
@@ -85,6 +88,8 @@ export interface RouteSegmentCostResponse {
   from_label: string;
   to_node_id: string;
   to_label: string;
+  leg_phase?: PffLegPhase | null;
+  handoff_role?: PffHandoffRole | null;
   transport_method: string;
   /** Zone that owns pricing for this segment (from_node when it is a zone id). */
   zone_id: number | null;

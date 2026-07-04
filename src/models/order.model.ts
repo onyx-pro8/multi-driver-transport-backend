@@ -1,4 +1,5 @@
 import type { OrderPackageEntry, PackageType } from "./package.model";
+import type { PaymentPackageEntry } from "./paymentPackage.model";
 
 export const ORDER_STATUSES = ["submitted", "delivering", "received"] as const;
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
@@ -33,6 +34,8 @@ export interface OrderRow {
   package_type: PackageType | null;
   packages: OrderPackageEntry[];
   package_factor: number | null;
+  payment_packages: PaymentPackageEntry[];
+  payment_pickup_notified_at: Date | null;
   weight_lbs: number | null;
   package_weight_unit: string;
   package_length: number | null;
@@ -43,6 +46,7 @@ export interface OrderRow {
   status: OrderStatus;
   tracking_status: import("./orderTracking.model").TrackingStatus;
   pickup_ready_at: Date | null;
+  goods_ready_at: Date | null;
   route_schedule_at: Date | null;
   submitted_at: Date;
   delivering_at: Date | null;
@@ -80,6 +84,8 @@ export interface OrderResponse {
   package_type: PackageType | null;
   packages: OrderPackageEntry[];
   package_factor: number | null;
+  payment_packages: PaymentPackageEntry[];
+  payment_pickup_notified_at: string | null;
   weight_lbs: number | null;
   package_weight_unit: string;
   package_length: number | null;
@@ -90,6 +96,7 @@ export interface OrderResponse {
   status: OrderStatus;
   tracking_status: import("./orderTracking.model").TrackingStatus;
   pickup_ready_at: string | null;
+  goods_ready_at: string | null;
   route_schedule_at?: string | null;
   /** Milestone 6/7 — populated on list/detail when a route has been selected. */
   route_selection_status?: import("./routeConfirmation.model").RouteSelectionStatus | null;

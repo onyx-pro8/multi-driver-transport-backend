@@ -5,6 +5,12 @@ import {
   PACKAGE_TYPES,
   normalizeOrderPackages,
 } from "../models/package.model";
+import {
+  MAX_PAYMENT_PACKAGES,
+  PAYMENT_PACKAGE_TYPES,
+  normalizePaymentPackages,
+} from "../models/paymentPackage.model";
+import { isPffPaymentMethod } from "../utils/paymentFlow";
 
 export const packageTypeSchema = z.enum(PACKAGE_TYPES);
 
@@ -38,6 +44,15 @@ function resolvePackagesInput(data: {
   });
 }
 
+export const paymentPackageEntrySchema = z.object({
+  payment_type: z.enum(PAYMENT_PACKAGE_TYPES),
+  description: z.string().trim().max(300).optional().default(""),
+  weight_lbs: positivePackageNumber("weight_lbs"),
+  package_length: positivePackageNumber("package_length"),
+  package_width: positivePackageNumber("package_width"),
+  package_height: positivePackageNumber("package_height"),
+});
+
 export const createReceiverOrderSchema = z.object({
   sender_user_id: z.number().int().positive(),
   destination_address: z.string().trim().min(1).max(300),
@@ -50,6 +65,11 @@ export const createReceiverOrderSchema = z.object({
   package_description: z.string().trim().max(1000).optional().default(""),
   package_type: packageTypeSchema.optional(),
   packages: z.array(orderPackageEntrySchema).min(1).max(MAX_PACKAGES).optional(),
+  payment_packages: z
+    .array(paymentPackageEntrySchema)
+    .min(1)
+    .max(MAX_PAYMENT_PACKAGES)
+    .optional(),
   weight_lbs: positivePackageNumber("weight_lbs").optional().nullable(),
   package_length: positivePackageNumber("package_length").optional().nullable(),
   package_width: positivePackageNumber("package_width").optional().nullable(),
@@ -63,6 +83,16 @@ export const createReceiverOrderSchema = z.object({
       path: ["packages"],
       message: "Provide at least one package with type, weight, and dimensions",
     });
+  }
+  if (isPffPaymentMethod(data.payment_method)) {
+    const paymentPackages = normalizePaymentPackages(data.payment_packages);
+    if (paymentPackages.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["payment_packages"],
+        message: "PFF orders require at least one payment package (cheque/cash)",
+      });
+    }
   }
 });
 

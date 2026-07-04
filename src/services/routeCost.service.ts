@@ -24,6 +24,8 @@ import {
 import type { ZonePricingMode } from "../models/pricingRegion.model";
 import { getOrderById, updateOrderRouteSchedule, type OrderContext } from "./order.service";
 import { isPffPaymentMethod } from "../utils/paymentFlow";
+import { totalPaymentPackageFactor } from "../models/paymentPackage.model";
+import { ensurePffRouteSegmentsForOrder } from "./pffRouteUpgrade.service";
 import { createUserNotification } from "./notification.service";
 import {
   DEFAULT_PREVIEW_MAX_DEPTH,
@@ -33,6 +35,7 @@ import {
   calculateSegmentCost,
   calculateSegmentDistanceH3,
   deriveSegmentsFromRoute,
+  expectedSegmentCountForRoute,
   haversineKm,
   type DerivedSegment,
   type SegmentRate,
@@ -587,53 +590,49 @@ async function computeSegmentDistances(
       ? { lat: order.destination_lat, lng: order.destination_lng }
       : null;
 
-  const perZone = new Map<
+  const perZoneForward = new Map<
     number,
     { cells: number | null; km: number | null; hours: number | null }
   >();
+  const perZoneReverse = new Map<
+    number,
+    { cells: number | null; km: number | null; hours: number | null }
+  >();
+
   for (let i = 0; i < zoneIds.length; i++) {
     const zoneId = zoneIds[i];
     const meta = zoneMeta.get(zoneId);
     const mode = meta?.transport_mode ?? "land";
     if (mode === "air" || mode === "sea") {
-      perZone.set(zoneId, {
+      const lineDist = {
         cells: null,
         km: zoneLineKm.get(zoneId) ?? null,
         hours: null,
-      });
+      };
+      perZoneForward.set(zoneId, lineDist);
+      perZoneReverse.set(zoneId, lineDist);
       continue;
     }
     const centroid = zoneCoords.get(zoneId) ?? null;
-    const entry = (i === 0 ? sender : transferAt(i - 1)) ?? centroid;
-    const exit =
+    const forwardEntry = (i === 0 ? sender : transferAt(i - 1)) ?? centroid;
+    const forwardExit =
       (i === zoneIds.length - 1 ? receiver : transferAt(i)) ?? centroid;
-    if (!entry || !exit) {
-      perZone.set(zoneId, { cells: null, km: null, hours: null });
-      continue;
-    }
-    const route = await resolveLandLegRoute(
-      entry.lat,
-      entry.lng,
-      exit.lat,
-      exit.lng,
+    const reverseEntry = (i === zoneIds.length - 1 ? receiver : transferAt(i)) ?? centroid;
+    const reverseExit = (i === 0 ? sender : transferAt(i - 1)) ?? centroid;
+
+    const forwardDist = await resolveZoneLegDistance(
+      forwardEntry,
+      forwardExit,
       meta?.resolution ?? undefined,
     );
-    let cells: number | null = null;
-    if (route.source === "h3") {
-      const d = calculateSegmentDistanceH3(
-        entry.lat,
-        entry.lng,
-        exit.lat,
-        exit.lng,
-        meta?.resolution ?? undefined,
-      );
-      cells = d.distance_h3_cells;
-    }
-    perZone.set(zoneId, {
-      cells,
-      km: route.distance_km,
-      hours: route.duration_hours,
-    });
+    perZoneForward.set(zoneId, forwardDist);
+
+    const reverseDist = await resolveZoneLegDistance(
+      reverseEntry,
+      reverseExit,
+      meta?.resolution ?? undefined,
+    );
+    perZoneReverse.set(zoneId, reverseDist);
   }
 
   const bySegment = new Map<
@@ -647,6 +646,8 @@ async function computeSegmentDistances(
   for (const seg of segments) {
     const line =
       seg.transport_method === "air" || seg.transport_method === "sea";
+    const perZone =
+      seg.leg_phase === "payment" ? perZoneReverse : perZoneForward;
     let cells = 0;
     let km = 0;
     let hours = 0;
@@ -676,6 +677,43 @@ async function computeSegmentDistances(
     });
   }
   return bySegment;
+}
+
+async function resolveZoneLegDistance(
+  entry: LatLng | null,
+  exit: LatLng | null,
+  resolution?: number,
+): Promise<{
+  cells: number | null;
+  km: number | null;
+  hours: number | null;
+}> {
+  if (!entry || !exit) {
+    return { cells: null, km: null, hours: null };
+  }
+  const route = await resolveLandLegRoute(
+    entry.lat,
+    entry.lng,
+    exit.lat,
+    exit.lng,
+    resolution,
+  );
+  let cells: number | null = null;
+  if (route.source === "h3") {
+    const d = calculateSegmentDistanceH3(
+      entry.lat,
+      entry.lng,
+      exit.lat,
+      exit.lng,
+      resolution,
+    );
+    cells = d.distance_h3_cells;
+  }
+  return {
+    cells,
+    km: route.distance_km,
+    hours: route.duration_hours,
+  };
 }
 
 async function loadTransporterNames(
@@ -953,7 +991,9 @@ export async function calculateRouteCost(
   const zoneLineDistances = await loadZoneLineDistances(zoneIds);
   const connectionIds = parseJsonIntArray(route.connection_ids);
   const connectionsById = await loadConnectionsByIds(connectionIds);
-  const segments = deriveSegmentsFromRoute(zoneIds, zoneMeta);
+  const isPff = isPffPaymentMethod(order.payment_method);
+  const segments = deriveSegmentsFromRoute(zoneIds, zoneMeta, isPff);
+  const pffFactor = isPff ? await getPffFactor() : 0;
   const segmentDistances = await computeSegmentDistances(
     zoneIds,
     connectionIds,
@@ -1028,6 +1068,10 @@ export async function calculateRouteCost(
     const rate = pricingEntry?.rate ?? null;
     const lineDistanceKm =
       zoneId != null ? (zoneLineDistances.get(zoneId) ?? null) : null;
+    const paymentPackageFactor =
+      seg.leg_phase === "payment"
+        ? totalPaymentPackageFactor(order.payment_packages ?? [])
+        : undefined;
     const cost = calculateSegmentCost({
       segment: seg,
       order,
@@ -1040,6 +1084,7 @@ export async function calculateRouteCost(
       bookingFeeRate,
       landSpeedKmh,
       pricingMode: pricingEntry?.pricing_mode ?? "system",
+      packageFactor: paymentPackageFactor,
     });
 
     const preserved = preservedManual.get(seg.segment_index);
@@ -1059,6 +1104,23 @@ export async function calculateRouteCost(
       cost.cost_status = "requested";
       cost.cost_source = null;
       cost.calculation_breakdown = null;
+    } else if (seg.leg_phase === "payment" && isPff && pffFactor >= 0) {
+      const scale = pffFactor;
+      if (cost.calculated_cost != null) {
+        cost.calculated_cost = Math.round(cost.calculated_cost * scale * 100) / 100;
+      }
+      if (cost.manual_cost != null) {
+        cost.manual_cost = Math.round(cost.manual_cost * scale * 100) / 100;
+      }
+      if (cost.final_cost != null) {
+        cost.final_cost = Math.round(cost.final_cost * scale * 100) / 100;
+      }
+      if (cost.calculation_breakdown) {
+        cost.calculation_breakdown = {
+          ...cost.calculation_breakdown,
+          total_cost: cost.final_cost ?? cost.calculation_breakdown.total_cost,
+        };
+      }
     }
 
     if (cost.cost_status === "calculated" && cost.calculated_cost != null) {
@@ -1072,11 +1134,11 @@ export async function calculateRouteCost(
     const insert = await pool.query(
       `INSERT INTO route_segment_costs
          (route_id, segment_index, transporter_id, from_node_id, to_node_id,
-          transport_method, package_weight, package_volume,
+          transport_method, leg_phase, handoff_role, package_weight, package_volume,
           distance_h3_cells, distance_km, time_hours, package_factor,
           base_fee, weight_cost, volume_cost, distance_cost, waiting_cost, booking_fee,
           time_factor_amount, calculated_cost, manual_cost, final_cost, cost_status, cost_source, currency, calculation_breakdown)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28::jsonb)
        RETURNING id`,
       [
         routeId,
@@ -1085,6 +1147,8 @@ export async function calculateRouteCost(
         seg.from_node_id,
         seg.to_node_id,
         seg.transport_method,
+        seg.leg_phase ?? null,
+        seg.handoff_role ?? null,
         null,
         null,
         cost.distance_h3_cells,
@@ -1173,8 +1237,18 @@ async function buildSegmentResponse(
   }
 
   const tid = Number(row.transporter_id);
-  const zoneId = nodeIdToZoneId(String(row.from_node_id));
+  const zoneId =
+    nodeIdToZoneId(String(row.from_node_id)) ??
+    nodeIdToZoneId(String(row.to_node_id));
   const pricing = zoneId != null ? (zonePricing?.get(zoneId) ?? null) : null;
+  const legPhaseRaw = row.leg_phase;
+  const leg_phase =
+    legPhaseRaw === "payment" || legPhaseRaw === "goods" ? legPhaseRaw : null;
+  const handoffRaw = row.handoff_role;
+  const handoff_role =
+    handoffRaw === "payment_delivery" || handoffRaw === "goods_pickup"
+      ? handoffRaw
+      : null;
   return {
     segment_id: Number(row.id),
     segment_index: Number(row.segment_index),
@@ -1184,6 +1258,8 @@ async function buildSegmentResponse(
     from_label: nodeLabel(String(row.from_node_id), zoneNames),
     to_node_id: String(row.to_node_id),
     to_label: nodeLabel(String(row.to_node_id), zoneNames),
+    leg_phase,
+    handoff_role,
     transport_method: String(row.transport_method),
     zone_id: zoneId,
     zone_pricing_mode: pricing?.pricing_mode ?? null,
@@ -1274,6 +1350,7 @@ export async function getRouteCostSummary(
     `SELECT * FROM route_segment_costs WHERE route_id = $1 ORDER BY segment_index`,
     [routeId],
   );
+  let segmentRows = segResult.rows;
 
   const zoneIds = parseJsonIntArray(route.zone_ids);
   const zoneMeta = await loadZoneMetaForIds(zoneIds);
@@ -1283,26 +1360,43 @@ export async function getRouteCostSummary(
   // Recompute when there are no rows yet, when any segment is `missing` (rates
   // newly configured), or when segmentation is stale. `requested` (e.g. air
   // awaiting quote) is stable and must NOT trigger recalc on every read.
-  const needsRecalc = segResult.rows.some((r) =>
+  const isPff = isPffPaymentMethod(order.payment_method);
+  const expectedSegmentCount = expectedSegmentCountForRoute(
+    zoneIds.length,
+    isPff,
+  );
+  const segmentationStale =
+    segmentRows.length !== expectedSegmentCount ||
+    (isPff && segmentRows.some((r) => r.leg_phase == null));
+  if (isPff && segmentationStale) {
+    await ensurePffRouteSegmentsForOrder(order.id, ctx);
+    const refreshed = await pool.query(
+      `SELECT * FROM route_segment_costs WHERE route_id = $1 ORDER BY segment_index`,
+      [routeId],
+    );
+    segmentRows = refreshed.rows;
+    if (segmentRows.length !== expectedSegmentCount) {
+      const summary = await calculateRouteCost(routeId, ctx);
+      return ctx.role === "driver"
+        ? scopeRouteSummaryForDriver(summary, ctx.userId)
+        : summary;
+    }
+  }
+  const needsRecalc = segmentRows.some((r) =>
     segmentNeedsRecalculation(String(r.cost_status) as SegmentCostStatus),
   );
-  const expectedSegmentCount = deriveSegmentsFromRoute(
-    zoneIds,
-    zoneMeta,
-  ).length;
-  const segmentationStale = segResult.rowCount !== expectedSegmentCount;
-  if (segResult.rowCount === 0 || needsRecalc || segmentationStale) {
+  if (segmentRows.length === 0 || needsRecalc) {
     const summary = await calculateRouteCost(routeId, ctx);
     return ctx.role === "driver"
       ? scopeRouteSummaryForDriver(summary, ctx.userId)
       : summary;
   }
 
-  const transporterIds = segResult.rows.map((r) => Number(r.transporter_id));
+  const transporterIds = segmentRows.map((r) => Number(r.transporter_id));
   const names = await loadTransporterNames(transporterIds);
 
   const segments: RouteSegmentCostResponse[] = [];
-  for (const row of segResult.rows) {
+  for (const row of segmentRows) {
     segments.push(
       await buildSegmentResponse(row, zoneMeta, names, zonePricing),
     );
@@ -1756,12 +1850,6 @@ async function buildOrderRouteComparison(
   const isPff = isPffPaymentMethod(orderRow.payment_method);
 
   if (isPff) {
-    for (const route of routes) {
-      if (route.total_final_cost != null) {
-        route.total_final_cost =
-          Math.round(route.total_final_cost * (1 + pffFactor) * 100) / 100;
-      }
-    }
     routes.sort((a, b) => {
       if (a.total_final_cost == null && b.total_final_cost == null) return 0;
       if (a.total_final_cost == null) return 1;
@@ -1868,6 +1956,11 @@ export async function compareOrderRoutes(
       400,
     );
   }
+
+  if (isPffPaymentMethod(order.payment_method)) {
+    await ensurePffRouteSegmentsForOrder(orderId, ctx);
+  }
+
   const lockInfo = await getOrderRouteLockInfo(order.id);
 
   if (lockInfo.locked) {

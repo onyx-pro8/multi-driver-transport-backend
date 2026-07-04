@@ -48,6 +48,8 @@ export interface SegmentConfirmationRow {
   created_at: Date;
 }
 
+export type PffLegPhase = "payment" | "goods";
+
 export interface SegmentConfirmationDetail {
   segment_id: number;
   segment_index: number;
@@ -57,6 +59,7 @@ export interface SegmentConfirmationDetail {
   from_label: string;
   to_node_id: string;
   to_label: string;
+  leg_phase?: PffLegPhase | null;
   status: SegmentConfirmationStatus;
   leg_status: SegmentLegStatus;
   rejection_reason: string | null;
@@ -97,6 +100,8 @@ export interface TransporterConfirmationItem {
   order_id: number;
   segment_id: number;
   segment_index: number;
+  leg_phase?: PffLegPhase | null;
+  handoff_role?: import("./routeCost.model").PffHandoffRole | null;
   from_label: string;
   to_label: string;
   status: SegmentConfirmationStatus;
@@ -109,6 +114,8 @@ export interface TransporterConfirmationItem {
   route_selection_status: RouteSelectionStatus | null;
   order_tracking_status: TrackingStatus;
   pickup_ready_at: string | null;
+  goods_ready_at: string | null;
+  payment_method: string;
   route_segment_count: number;
   previous_leg_status: SegmentLegStatus | null;
   final_cost: number | null;

@@ -39,6 +39,12 @@ import {
   isPackageType,
 } from "../models/package.model";
 import type { OrderPackageEntry, PackageType } from "../models/package.model";
+import {
+  normalizePaymentPackages,
+  parsePaymentPackagesFromStorage,
+} from "../models/paymentPackage.model";
+import { isPffPaymentMethod } from "../utils/paymentFlow";
+import { syncOrderTrackingFromSegments } from "./segment_tracking.service";
 
 /**
  * H3 resolution at which order pickup / delivery coordinates are indexed.
@@ -91,7 +97,8 @@ export async function syncLegacyOrderStatus(
   if (
     trackingStatus === "PICKUP_AVAILABLE" ||
     trackingStatus === "PICKED_UP" ||
-    trackingStatus === "IN_TRANSIT"
+    trackingStatus === "IN_TRANSIT" ||
+    trackingStatus === "PAYMENT_DELIVERED"
   ) {
     await pool.query(
       `UPDATE orders
@@ -164,6 +171,10 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
       }
     ),
     package_factor: toNullable(row.package_factor),
+    payment_packages: parsePaymentPackagesFromStorage(row.payment_packages),
+    payment_pickup_notified_at: row.payment_pickup_notified_at
+      ? new Date(String(row.payment_pickup_notified_at))
+      : null,
     weight_lbs:
       toNullable(row.weight_lbs) ??
       (String(row.package_weight_unit ?? "lb") === "kg" && row.weight_kg != null
@@ -180,6 +191,7 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
       ? row.tracking_status
       : "CONFIRMED") as TrackingStatus,
     pickup_ready_at: row.pickup_ready_at ? new Date(String(row.pickup_ready_at)) : null,
+    goods_ready_at: row.goods_ready_at ? new Date(String(row.goods_ready_at)) : null,
     route_schedule_at: row.route_schedule_at ? new Date(String(row.route_schedule_at)) : null,
     submitted_at: new Date(String(row.submitted_at)),
     delivering_at: row.delivering_at ? new Date(String(row.delivering_at)) : null,
@@ -217,6 +229,8 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     package_type: order.package_type,
     packages: order.packages,
     package_factor: order.package_factor,
+    payment_packages: order.payment_packages,
+    payment_pickup_notified_at: order.payment_pickup_notified_at?.toISOString() ?? null,
     weight_lbs: order.weight_lbs,
     package_weight_unit: order.package_weight_unit,
     package_length: order.package_length,
@@ -227,6 +241,7 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     status: order.status,
     tracking_status: order.tracking_status,
     pickup_ready_at: order.pickup_ready_at?.toISOString() ?? null,
+    goods_ready_at: order.goods_ready_at?.toISOString() ?? null,
     route_schedule_at: order.route_schedule_at?.toISOString() ?? null,
     route_selection_status: isRouteSelectionStatus(row.route_selection_status)
       ? row.route_selection_status
@@ -438,6 +453,11 @@ export async function createOrderByReceiver(
   const packageHeight = rolledUp.package_height;
   const dimensionsText = data.dimensions?.trim() || rolledUp.dimensions;
 
+  const isPff = isPffPaymentMethod(data.payment_method);
+  const paymentPackages = isPff
+    ? normalizePaymentPackages(data.payment_packages)
+    : normalizePaymentPackages(undefined);
+
   const insert = await pool.query(
     `INSERT INTO orders
        (sender_user_id, receiver_user_id, driver_user_id,
@@ -446,14 +466,14 @@ export async function createOrderByReceiver(
         receiver_phone, notes,
         pickup_h3, delivery_h3, h3_resolution,
         source_name, source_contact, payment_method, shipping_method,
-        package_description, package_type, packages, package_factor,
+        package_description, package_type, packages, package_factor, payment_packages,
         weight_kg, weight_lbs, package_weight_unit,
         package_length, package_width, package_height, package_dimension_unit,
         dimensions,
         status, tracking_status, submitted_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
              $14, $15, $16, $17, $18, $19, $20, $21, $22,
-             $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
+             $23::jsonb, $24, $25::jsonb, $26, $27, $28, $29, $30, $31, $32, $33,
              'submitted', 'AWAITING_CONNECT', NOW())
      RETURNING id`,
     [
@@ -481,6 +501,7 @@ export async function createOrderByReceiver(
       packageType,
       JSON.stringify(packages),
       packageFactor,
+      JSON.stringify(paymentPackages),
       weightLbs,
       weightLbs,
       "lb",
@@ -667,6 +688,24 @@ export async function listOrders(ctx: OrderContext): Promise<OrderResponse[]> {
     `${ORDER_SELECT} ${where} ORDER BY o.created_at DESC`,
     params
   );
+
+  const needsSync = result.rows.filter(
+    (row) =>
+      isPffPaymentMethod(String(row.payment_method ?? "")) &&
+      row.pickup_ready_at &&
+      !["DELIVERED", "REJECTED", "AWAITING_CONNECT"].includes(String(row.tracking_status ?? ""))
+  );
+  if (needsSync.length > 0) {
+    await Promise.all(
+      needsSync.map((row) => syncOrderTrackingFromSegments(Number(row.id)))
+    );
+    const refreshed = await pool.query(
+      `${ORDER_SELECT} ${where} ORDER BY o.created_at DESC`,
+      params
+    );
+    return refreshed.rows.map(rowToOrder);
+  }
+
   return result.rows.map(rowToOrder);
 }
 
@@ -696,7 +735,23 @@ export async function getOrderById(id: number, ctx: OrderContext): Promise<Order
     params
   );
   if (result.rowCount === 0) return null;
-  return rowToOrder(result.rows[0]);
+
+  const row = result.rows[0];
+  if (
+    isPffPaymentMethod(String(row.payment_method ?? "")) &&
+    row.pickup_ready_at &&
+    !["DELIVERED", "REJECTED", "AWAITING_CONNECT"].includes(String(row.tracking_status ?? ""))
+  ) {
+    await syncOrderTrackingFromSegments(id);
+    const refreshed = await pool.query(
+      `${ORDER_SELECT} WHERE o.id = $1${extra}`,
+      params
+    );
+    if (refreshed.rowCount === 0) return null;
+    return rowToOrder(refreshed.rows[0]);
+  }
+
+  return rowToOrder(row);
 }
 
 export async function updateOrderStatus(

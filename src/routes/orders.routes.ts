@@ -42,6 +42,7 @@ import {
 import {
   getOrderStatus,
   updateOrderStatus as updateTrackingStatus,
+  notifyPaymentPickedUpToSender,
   OrderStatusError,
 } from "../services/order_status.service";
 import { TRACKING_STATUSES } from "../models/orderTracking.model";
@@ -226,6 +227,19 @@ ordersRouter.patch("/:id/tracking-status", async (req: AuthenticatedRequest, res
   }
   try {
     const status = await updateTrackingStatus(id, parsed.data.status, ctx(req));
+    res.json(status);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.post("/:id/notify-payment-pickup", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  try {
+    const status = await notifyPaymentPickedUpToSender(id, ctx(req));
     res.json(status);
   } catch (err) {
     handle(res, err);

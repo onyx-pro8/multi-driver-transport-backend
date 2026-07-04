@@ -10,6 +10,9 @@ import { DEFAULT_BOOKING_FEE_RATE, DEFAULT_LAND_SPEED_KMH } from "../models/pric
 import type { ZonePricingMode } from "../models/pricingRegion.model";
 import { ORDER_H3_RESOLUTION } from "./order.service";
 
+export type PffLegPhase = "payment" | "goods";
+export type PffHandoffRole = "payment_delivery" | "goods_pickup";
+
 export interface DerivedSegment {
   segment_index: number;
   transporter_id: number;
@@ -19,6 +22,12 @@ export interface DerivedSegment {
   from_zone_id: number | null;
   to_zone_id: number | null;
   zone_ids: number[];
+  /** PFF round-trip: payment (receiver→sender) or goods (sender→receiver). */
+  leg_phase?: PffLegPhase | null;
+  /** Producer handoff: same transporter delivers payment then collects goods. */
+  handoff_role?: PffHandoffRole | null;
+  /** Index of the priced zone in the original forward zone chain. */
+  forward_zone_index: number;
 }
 
 function roundMoney(n: number): number {
@@ -422,25 +431,30 @@ export function calculateSegmentCost(input: SegmentCostInput): SegmentCostResult
   };
 }
 
-export function deriveSegmentsFromRoute(
+function deriveForwardSegments(
   zoneIds: number[],
-  zoneMeta: Map<number, { owner_user_id: number; transport_mode: string | null }>
+  zoneMeta: Map<number, { owner_user_id: number; transport_mode: string | null }>,
+  options: {
+    indexOffset: number;
+    legPhase: PffLegPhase | null;
+    startNode: "sender" | "receiver";
+    endNode: "sender" | "receiver";
+  },
 ): DerivedSegment[] {
-  if (zoneIds.length === 0) return [];
-
   const segments: DerivedSegment[] = [];
   for (let i = 0; i < zoneIds.length; i++) {
     const zoneId = zoneIds[i];
     const meta = zoneMeta.get(zoneId);
     if (!meta) continue;
     const method = meta.transport_mode ?? "land";
+    const fromNode = i === 0 ? options.startNode : String(zoneIds[i - 1]);
+    const toNode = i === zoneIds.length - 1 ? options.endNode : String(zoneId);
 
-    const isFirst = segments.length === 0;
-    const fromNode = isFirst ? "sender" : String(zoneIds[i - 1]);
-    const toNode = i === zoneIds.length - 1 ? "receiver" : String(zoneId);
+    const isGoodsHandoff =
+      options.legPhase === "goods" && i === 0 && options.startNode === "sender";
 
     segments.push({
-      segment_index: segments.length,
+      segment_index: options.indexOffset + segments.length,
       transporter_id: meta.owner_user_id,
       from_node_id: fromNode,
       to_node_id: toNode,
@@ -448,8 +462,79 @@ export function deriveSegmentsFromRoute(
       from_zone_id: zoneId,
       to_zone_id: zoneId,
       zone_ids: [zoneId],
+      leg_phase: options.legPhase,
+      handoff_role: isGoodsHandoff ? "goods_pickup" : null,
+      forward_zone_index: i,
+    });
+  }
+  return segments;
+}
+
+function deriveReversePaymentSegments(
+  zoneIds: number[],
+  zoneMeta: Map<number, { owner_user_id: number; transport_mode: string | null }>,
+  indexOffset: number,
+): DerivedSegment[] {
+  const segments: DerivedSegment[] = [];
+  const n = zoneIds.length;
+  for (let i = 0; i < n; i++) {
+    const forwardIndex = n - 1 - i;
+    const zoneId = zoneIds[forwardIndex];
+    const meta = zoneMeta.get(zoneId);
+    if (!meta) continue;
+    const method = meta.transport_mode ?? "land";
+    const fromNode = i === 0 ? "receiver" : String(zoneIds[n - i]);
+    const toNode = i === n - 1 ? "sender" : String(zoneIds[n - i - 1]);
+
+    const isPaymentHandoff = i === n - 1;
+
+    segments.push({
+      segment_index: indexOffset + segments.length,
+      transporter_id: meta.owner_user_id,
+      from_node_id: fromNode,
+      to_node_id: toNode,
+      transport_method: method,
+      from_zone_id: zoneId,
+      to_zone_id: zoneId,
+      zone_ids: [zoneId],
+      leg_phase: "payment",
+      handoff_role: isPaymentHandoff ? "payment_delivery" : null,
+      forward_zone_index: forwardIndex,
+    });
+  }
+  return segments;
+}
+
+export function deriveSegmentsFromRoute(
+  zoneIds: number[],
+  zoneMeta: Map<number, { owner_user_id: number; transport_mode: string | null }>,
+  isPff = false,
+): DerivedSegment[] {
+  if (zoneIds.length === 0) return [];
+
+  if (!isPff) {
+    return deriveForwardSegments(zoneIds, zoneMeta, {
+      indexOffset: 0,
+      legPhase: null,
+      startNode: "sender",
+      endNode: "receiver",
     });
   }
 
-  return segments;
+  const payment = deriveReversePaymentSegments(zoneIds, zoneMeta, 0);
+  const goods = deriveForwardSegments(zoneIds, zoneMeta, {
+    indexOffset: payment.length,
+    legPhase: "goods",
+    startNode: "sender",
+    endNode: "receiver",
+  });
+  return [...payment, ...goods];
+}
+
+export function expectedSegmentCountForRoute(
+  zoneCount: number,
+  isPff: boolean,
+): number {
+  if (zoneCount === 0) return 0;
+  return isPff ? zoneCount * 2 : zoneCount;
 }

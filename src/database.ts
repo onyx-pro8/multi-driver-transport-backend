@@ -720,7 +720,10 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_tracking_status_check;`);
     await client.query(
       `ALTER TABLE orders ADD CONSTRAINT orders_tracking_status_check
-         CHECK (tracking_status IN ('AWAITING_CONNECT', 'REJECTED', 'CONFIRMED', 'PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED'));`
+         CHECK (tracking_status IN (
+           'AWAITING_CONNECT', 'REJECTED', 'CONFIRMED', 'PICKUP_AVAILABLE',
+           'PICKED_UP', 'IN_TRANSIT', 'PAYMENT_DELIVERED', 'DELIVERED'
+         ));`
     );
     await client.query(
       `ALTER TABLE orders ADD COLUMN IF NOT EXISTS route_schedule_at TIMESTAMPTZ;`
@@ -742,7 +745,7 @@ export async function ensureSchema(): Promise<void> {
       `UPDATE orders
        SET status = 'delivering',
            delivering_at = COALESCE(delivering_at, updated_at, NOW())
-       WHERE tracking_status IN ('PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT')
+       WHERE tracking_status IN ('PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'PAYMENT_DELIVERED')
          AND status = 'submitted'`
     );
 
@@ -758,6 +761,35 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_order_status_history_order ON order_status_history (order_id);`);
     await client.query(
       `ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_ready_at TIMESTAMPTZ;`
+    );
+    await client.query(
+      `ALTER TABLE orders ADD COLUMN IF NOT EXISTS goods_ready_at TIMESTAMPTZ;`
+    );
+    await client.query(
+      `ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS leg_phase TEXT;`
+    );
+    await client.query(
+      `ALTER TABLE route_segment_costs DROP CONSTRAINT IF EXISTS route_segment_costs_leg_phase_check;`
+    );
+    await client.query(
+      `ALTER TABLE route_segment_costs ADD CONSTRAINT route_segment_costs_leg_phase_check
+         CHECK (leg_phase IS NULL OR leg_phase IN ('payment', 'goods'));`
+    );
+    await client.query(
+      `ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS handoff_role TEXT;`
+    );
+    await client.query(
+      `ALTER TABLE route_segment_costs DROP CONSTRAINT IF EXISTS route_segment_costs_handoff_role_check;`
+    );
+    await client.query(
+      `ALTER TABLE route_segment_costs ADD CONSTRAINT route_segment_costs_handoff_role_check
+         CHECK (handoff_role IS NULL OR handoff_role IN ('payment_delivery', 'goods_pickup'));`
+    );
+    await client.query(
+      `ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_packages JSONB NOT NULL DEFAULT '[]'::jsonb;`
+    );
+    await client.query(
+      `ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_pickup_notified_at TIMESTAMPTZ;`
     );
 
     await client.query(`

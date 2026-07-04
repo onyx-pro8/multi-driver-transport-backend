@@ -12,6 +12,8 @@ import { isSegmentLegStatus } from "../models/routeConfirmation.model";
 import { addStatusHistory } from "./order_status.service";
 import { createUserNotification, notifyOrderParticipants } from "./notification.service";
 import { getOrderById, type OrderContext } from "./order.service";
+import { isPffPaymentMethod } from "../utils/paymentFlow";
+import { syncOrderTrackingFromSegments } from "./segment_tracking.service";
 import { isOrderRouteLocked } from "./orderRouteLock.service";
 import {
   RouteCostError,
@@ -323,6 +325,8 @@ export async function getRouteConfirmationStatus(
       from_label: seg.from_label,
       to_node_id: seg.to_node_id,
       to_label: seg.to_label,
+      leg_phase: seg.leg_phase ?? null,
+      handoff_role: seg.handoff_role ?? null,
       status,
       leg_status: isSegmentLegStatus(conf?.leg_status) ? conf.leg_status : "not_started",
       rejection_reason: conf?.rejection_reason != null ? String(conf.rejection_reason) : null,
@@ -449,6 +453,26 @@ export async function listTransporterConfirmations(
   }
   const transporterId = ctx.userId;
 
+  const initialResult = await pool.query(
+    `SELECT DISTINCT o.id AS order_id, o.payment_method, o.pickup_ready_at, o.tracking_status
+     FROM segment_confirmations sc
+     JOIN order_routes r ON r.id = sc.route_id
+     JOIN orders o ON o.id = r.order_id
+     WHERE sc.transporter_id = $1`,
+    [transporterId]
+  );
+  const syncTargets = initialResult.rows.filter(
+    (row) =>
+      isPffPaymentMethod(String(row.payment_method ?? "")) &&
+      row.pickup_ready_at &&
+      !["DELIVERED", "REJECTED", "AWAITING_CONNECT"].includes(String(row.tracking_status ?? ""))
+  );
+  if (syncTargets.length > 0) {
+    await Promise.all(
+      syncTargets.map((row) => syncOrderTrackingFromSegments(Number(row.order_id)))
+    );
+  }
+
   const result = await pool.query(
     `SELECT sc.id AS confirmation_id,
             sc.route_id,
@@ -459,12 +483,16 @@ export async function listTransporterConfirmations(
             r.order_id,
             r.route_label,
             rsc.segment_index,
+            rsc.leg_phase,
+            rsc.handoff_role,
             rsc.from_node_id,
             rsc.to_node_id,
             o.sender_address,
             o.destination_address,
             o.tracking_status AS order_tracking_status,
             o.pickup_ready_at,
+            o.goods_ready_at,
+            o.payment_method,
             rs.status AS route_selection_status,
             (
               SELECT COUNT(*)::int
@@ -475,7 +503,12 @@ export async function listTransporterConfirmations(
               SELECT sc_prev.leg_status
               FROM route_segment_costs rsc_prev
               JOIN segment_confirmations sc_prev ON sc_prev.segment_id = rsc_prev.id
-              WHERE rsc_prev.route_id = r.id AND rsc_prev.segment_index = rsc.segment_index - 1
+              WHERE rsc_prev.route_id = r.id
+                AND rsc_prev.segment_index = rsc.segment_index - 1
+                AND (
+                  rsc.leg_phase IS NULL
+                  OR rsc_prev.leg_phase IS NOT DISTINCT FROM rsc.leg_phase
+                )
               LIMIT 1
             ) AS previous_leg_status,
             rcr.sent_at
@@ -512,6 +545,14 @@ export async function listTransporterConfirmations(
       order_id: Number(row.order_id),
       segment_id: Number(row.segment_id),
       segment_index: Number(row.segment_index),
+      leg_phase:
+        row.leg_phase === "payment" || row.leg_phase === "goods"
+          ? row.leg_phase
+          : null,
+      handoff_role:
+        row.handoff_role === "payment_delivery" || row.handoff_role === "goods_pickup"
+          ? row.handoff_role
+          : seg?.handoff_role ?? null,
       from_label: seg?.from_label ?? String(row.from_node_id),
       to_label: seg?.to_label ?? String(row.to_node_id),
       status: String(row.status) as SegmentConfirmationStatus,
@@ -531,6 +572,10 @@ export async function listTransporterConfirmations(
       pickup_ready_at: row.pickup_ready_at
         ? new Date(String(row.pickup_ready_at)).toISOString()
         : null,
+      goods_ready_at: row.goods_ready_at
+        ? new Date(String(row.goods_ready_at)).toISOString()
+        : null,
+      payment_method: String(row.payment_method ?? ""),
       route_segment_count: Number(row.route_segment_count ?? 0),
       previous_leg_status: isSegmentLegStatus(row.previous_leg_status)
         ? row.previous_leg_status

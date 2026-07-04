@@ -5,6 +5,7 @@ export const TRACKING_STATUSES = [
   "PICKUP_AVAILABLE",
   "PICKED_UP",
   "IN_TRANSIT",
+  "PAYMENT_DELIVERED",
   "DELIVERED",
 ] as const;
 export type TrackingStatus = (typeof TRACKING_STATUSES)[number];

@@ -8,7 +8,7 @@ import {
 } from "../models/orderTracking.model";
 import { getOrderById, syncLegacyOrderStatus, type OrderContext } from "./order.service";
 import { isPffPaymentMethod } from "../utils/paymentFlow";
-import { notifyOrderParticipants } from "./notification.service";
+import { notifyOrderParticipants, createUserNotification } from "./notification.service";
 import { syncOrderTrackingFromSegments } from "./segment_tracking.service";
 
 export class OrderStatusError extends Error {
@@ -25,7 +25,8 @@ const TRANSITIONS: Record<TrackingStatus, TrackingStatus[]> = {
   CONFIRMED: ["PICKUP_AVAILABLE"],
   PICKUP_AVAILABLE: ["PICKED_UP"],
   PICKED_UP: ["IN_TRANSIT"],
-  IN_TRANSIT: ["DELIVERED"],
+  IN_TRANSIT: ["DELIVERED", "PAYMENT_DELIVERED"],
+  PAYMENT_DELIVERED: ["PICKUP_AVAILABLE"],
   DELIVERED: [],
 };
 
@@ -179,6 +180,53 @@ export async function updateOrderStatus(
   if (status === "PICKUP_AVAILABLE") {
     const isPff = isPffPaymentMethod(order.payment_method);
     if (isPff) {
+      const goodsReadyResult = await pool.query(
+        `SELECT goods_ready_at FROM orders WHERE id = $1`,
+        [orderId]
+      );
+      const goodsReadyAt = goodsReadyResult.rows[0]?.goods_ready_at
+        ? new Date(String(goodsReadyResult.rows[0].goods_ready_at))
+        : null;
+
+      if (current === "PAYMENT_DELIVERED" || goodsReadyAt) {
+        if (ctx.role !== "sender" && ctx.role !== "admin") {
+          throw new OrderStatusError(
+            "Only the sender can mark goods ready after payment is delivered",
+            403
+          );
+        }
+        if (ctx.role === "sender" && order.sender_user_id !== ctx.userId) {
+          throw new OrderStatusError("Forbidden", 403);
+        }
+        if (goodsReadyAt) {
+          return getOrderStatus(orderId, ctx);
+        }
+        if (current !== "PAYMENT_DELIVERED") {
+          throw new OrderStatusError(
+            "Payment must be delivered to the producer before goods can be marked ready",
+            400
+          );
+        }
+        await pool.query(
+          `UPDATE orders
+           SET tracking_status = 'PICKUP_AVAILABLE', goods_ready_at = NOW(), updated_at = NOW()
+           WHERE id = $1`,
+          [orderId]
+        );
+        await addStatusHistory(orderId, "GOODS_READY", ctx.userId);
+        await syncLegacyOrderStatus(orderId, "PICKUP_AVAILABLE");
+
+        void notifyOrderParticipants({
+          order_id: orderId,
+          type: "goods_ready",
+          title: "Goods ready for pickup",
+          body: `Shipment #${orderId}: producer marked goods ready. Transporters can collect the order for delivery to the receiver.`,
+          exclude_user_id: ctx.userId,
+        }).catch((err) => console.error("[notifications] goods_ready failed:", err));
+
+        return getOrderStatus(orderId, ctx);
+      }
+
       if (ctx.role !== "receiver" && ctx.role !== "admin") {
         throw new OrderStatusError(
           "Only the receiver can mark pickup available for PFF (Advanced Payment) orders",
@@ -209,9 +257,9 @@ export async function updateOrderStatus(
     void notifyOrderParticipants({
       order_id: orderId,
       type: "pickup_ready",
-      title: isPff ? "PFF pickup available" : "Pickup ready",
+      title: isPff ? "PFF payment pickup available" : "Pickup ready",
       body: isPff
-        ? `Shipment #${orderId}: receiver marked pickup available. Producer — prepare payment package (cheque/cash) for the delivering transporter. Transporters may begin collection.`
+        ? `Shipment #${orderId}: receiver marked payment pickup available. Transporters may collect the payment package (cheque/cash) from the receiver. Producer — prepare goods after payment arrives.`
         : `Shipment #${orderId} is ready for pickup. Transporters on the route can begin collection.`,
       exclude_user_id: ctx.userId,
     }).catch((err) => console.error("[notifications] pickup_ready failed:", err));
@@ -219,7 +267,8 @@ export async function updateOrderStatus(
     return getOrderStatus(orderId, ctx);
   }
 
-  if (!pickupReadyAt) {
+  const isPff = isPffPaymentMethod(order.payment_method);
+  if (!pickupReadyAt && !(isPff && status === "DELIVERED")) {
     throw new OrderStatusError("Sender must mark pickup as ready first", 400);
   }
 
@@ -264,6 +313,65 @@ export async function updateOrderStatus(
       exclude_user_id: ctx.userId,
     }).catch((err) => console.error("[notifications] delivered failed:", err));
   }
+
+  return getOrderStatus(orderId, ctx);
+}
+
+export async function notifyPaymentPickedUpToSender(
+  orderId: number,
+  ctx: OrderContext
+): Promise<OrderTrackingResponse> {
+  const order = await getOrderById(orderId, ctx);
+  if (!order) throw new OrderStatusError("Order not found", 404);
+  if (!isPffPaymentMethod(order.payment_method)) {
+    throw new OrderStatusError("Only PFF orders support payment pickup notification", 400);
+  }
+  if (ctx.role !== "receiver" && ctx.role !== "admin") {
+    throw new OrderStatusError("Only the receiver can notify the producer about payment pickup", 403);
+  }
+  if (ctx.role === "receiver" && order.receiver_user_id !== ctx.userId) {
+    throw new OrderStatusError("Forbidden", 403);
+  }
+  if (order.payment_pickup_notified_at) {
+    return getOrderStatus(orderId, ctx);
+  }
+  if (!order.pickup_ready_at) {
+    throw new OrderStatusError("Payment pickup must be marked available first", 400);
+  }
+
+  const pickupSeg = await pool.query(
+    `SELECT sc.leg_status
+     FROM route_segment_costs rsc
+     JOIN segment_confirmations sc ON sc.segment_id = rsc.id
+     JOIN route_selections rs ON rs.selected_route_id = rsc.route_id AND rs.order_id = $1
+     WHERE rsc.leg_phase = 'payment' AND rsc.segment_index = (
+       SELECT MIN(segment_index) FROM route_segment_costs r2
+       WHERE r2.route_id = rsc.route_id AND r2.leg_phase = 'payment'
+     )
+     LIMIT 1`,
+    [orderId]
+  );
+  const legStatus = pickupSeg.rows[0]?.leg_status;
+  if (legStatus !== "picked_up" && legStatus !== "in_transit") {
+    throw new OrderStatusError(
+      "A transporter must mark the payment package as picked up before you can notify the producer",
+      400
+    );
+  }
+
+  await pool.query(
+    `UPDATE orders SET payment_pickup_notified_at = NOW(), updated_at = NOW() WHERE id = $1`,
+    [orderId]
+  );
+  await addStatusHistory(orderId, "PAYMENT_PICKUP_NOTIFIED", ctx.userId);
+
+  void createUserNotification({
+    user_id: order.sender_user_id,
+    order_id: orderId,
+    type: "payment_pickup_notified",
+    title: "Payment collected from receiver",
+    body: `Shipment #${orderId}: the receiver confirms the payment package was collected. Prepare the ordered goods for the delivering transporter.`,
+  }).catch((err) => console.error("[notifications] payment_pickup_notified failed:", err));
 
   return getOrderStatus(orderId, ctx);
 }

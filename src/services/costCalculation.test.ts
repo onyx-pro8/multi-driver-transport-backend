@@ -6,6 +6,7 @@ import {
   calculateTotalCost,
   calculateTravelCost,
   calculateWaitingCost,
+  deriveSegmentsFromRoute,
   estimateLandTransitHours,
   resolveSegmentTimeHours,
   scheduleDurationHours,
@@ -91,6 +92,39 @@ describe("segment status helpers", () => {
     assert.equal(segmentNeedsCostEntry("requested"), true);
     assert.equal(segmentNeedsRecalculation("requested"), false);
     assert.equal(segmentNeedsRecalculation("missing"), true);
+  });
+});
+
+describe("deriveSegmentsFromRoute", () => {
+  it("builds sender-to-receiver segments for standard orders", () => {
+    const zoneMeta = new Map([
+      [10, { owner_user_id: 1, transport_mode: "land" }],
+      [20, { owner_user_id: 2, transport_mode: "land" }],
+    ]);
+    const segments = deriveSegmentsFromRoute([10, 20], zoneMeta, false);
+    assert.equal(segments.length, 2);
+    assert.equal(segments[0].from_node_id, "sender");
+    assert.equal(segments[0].to_node_id, "10");
+    assert.equal(segments[1].to_node_id, "receiver");
+    assert.equal(segments[0].leg_phase, null);
+  });
+
+  it("builds payment then goods legs for PFF orders", () => {
+    const zoneMeta = new Map([
+      [10, { owner_user_id: 1, transport_mode: "land" }],
+      [20, { owner_user_id: 2, transport_mode: "land" }],
+    ]);
+    const segments = deriveSegmentsFromRoute([10, 20], zoneMeta, true);
+    assert.equal(segments.length, 4);
+    assert.equal(segments[0].leg_phase, "payment");
+    assert.equal(segments[0].from_node_id, "receiver");
+    assert.equal(segments[0].to_node_id, "20");
+    assert.equal(segments[1].from_node_id, "20");
+    assert.equal(segments[1].to_node_id, "sender");
+    assert.equal(segments[2].leg_phase, "goods");
+    assert.equal(segments[2].from_node_id, "sender");
+    assert.equal(segments[2].to_node_id, "10");
+    assert.equal(segments[3].to_node_id, "receiver");
   });
 });
 
