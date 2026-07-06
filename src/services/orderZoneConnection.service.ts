@@ -7,6 +7,7 @@ import type {
 } from "../models/zoneConnection.model";
 import {
   buildZoneScheduleFields,
+  describeZoneScheduleInactiveReason,
   formatZoneScheduleSummary,
   isZoneScheduleActive,
   parseScheduleFromRow,
@@ -193,6 +194,21 @@ export interface OrderDraftGap {
   suggested_zone_name: string | null;
   /** Human-readable explanation + suggestion for the sender. */
   message: string;
+  /** Zones in the network that could bridge this gap (may be closed by schedule). */
+  bridge_candidates: GapBridgeCandidate[];
+  /** Short summary of bridge zone availability. */
+  bridge_message: string | null;
+}
+
+export interface GapBridgeCandidate {
+  zone_id: number;
+  zone_name: string;
+  transport_name: string;
+  schedule_active: boolean;
+  schedule_summary: string | null;
+  inactive_reason: string | null;
+  on_pickup_side: boolean;
+  on_destination_side: boolean;
 }
 
 export interface OrderDraftPreview {
@@ -237,6 +253,8 @@ export interface ScheduleInactiveZone {
   zone_name: string;
   transport_name: string;
   schedule_summary: string | null;
+  /** Why the zone is excluded from routing at the preview time. */
+  inactive_reason: string | null;
   covers: "pickup" | "destination" | "both";
 }
 
@@ -434,7 +452,8 @@ function buildScheduleInactiveZones(
   pickupIdsRaw: Set<number>,
   destIdsRaw: Set<number>,
   activeZoneIds: Set<number>,
-  allZonesById: Map<number, ZoneMeta>
+  allZonesById: Map<number, ZoneMeta>,
+  now: Date,
 ): ScheduleInactiveZone[] {
   const items: ScheduleInactiveZone[] = [];
   const seen = new Set<number>();
@@ -444,11 +463,14 @@ function buildScheduleInactiveZones(
     const z = allZonesById.get(id);
     if (!z) return;
     seen.add(id);
+    const fields = zoneMetaScheduleFields(z);
+    const inactive = describeZoneScheduleInactiveReason(fields, now);
     items.push({
       zone_id: z.id,
       zone_name: z.zone_name,
       transport_name: z.transport_name,
-      schedule_summary: formatZoneScheduleSummary(zoneMetaScheduleFields(z)),
+      schedule_summary: formatZoneScheduleSummary(fields),
+      inactive_reason: inactive?.label ?? "Not available at this time",
       covers,
     });
   }
@@ -889,6 +911,132 @@ function nearestZonePair(
   return best;
 }
 
+type ZoneAdjacency = Map<number, { neighbour: number; connection: ConnectionRow }[]>;
+
+function buildAdjacency(
+  connections: ConnectionRow[],
+  zoneIds: Set<number>,
+): ZoneAdjacency {
+  const adjacency: ZoneAdjacency = new Map();
+  for (const c of connections) {
+    if (!zoneIds.has(c.zone_a_id) || !zoneIds.has(c.zone_b_id)) continue;
+    if (!adjacency.has(c.zone_a_id)) adjacency.set(c.zone_a_id, []);
+    if (!adjacency.has(c.zone_b_id)) adjacency.set(c.zone_b_id, []);
+    adjacency.get(c.zone_a_id)!.push({ neighbour: c.zone_b_id, connection: c });
+    adjacency.get(c.zone_b_id)!.push({ neighbour: c.zone_a_id, connection: c });
+  }
+  return adjacency;
+}
+
+function buildGapBridgeCandidates(
+  pickupFrontierId: number,
+  destFrontierId: number,
+  fullAdjacency: ZoneAdjacency,
+  allZonesById: Map<number, ZoneMeta>,
+  activeZoneIds: Set<number>,
+  pickupIdsRaw: Set<number>,
+  destIdsRaw: Set<number>,
+  isActiveGraphConnected: boolean,
+  maxDepth: number,
+  extraHops: number,
+  now: Date,
+): { candidates: GapBridgeCandidate[]; bridge_message: string } {
+  const candidateMap = new Map<number, GapBridgeCandidate>();
+
+  const pickupNeighbours = new Set(
+    (fullAdjacency.get(pickupFrontierId) ?? []).map((e) => e.neighbour),
+  );
+  const destNeighbours = new Set(
+    (fullAdjacency.get(destFrontierId) ?? []).map((e) => e.neighbour),
+  );
+
+  function addCandidate(zoneId: number, onPickup: boolean, onDest: boolean) {
+    if (zoneId === pickupFrontierId || zoneId === destFrontierId) return;
+    const z = allZonesById.get(zoneId);
+    if (!z) return;
+    const fields = zoneMetaScheduleFields(z);
+    const isActive = activeZoneIds.has(zoneId);
+    const inactive = describeZoneScheduleInactiveReason(fields, now);
+    candidateMap.set(zoneId, {
+      zone_id: z.id,
+      zone_name: z.zone_name,
+      transport_name: z.transport_name,
+      schedule_active: isActive,
+      schedule_summary: formatZoneScheduleSummary(fields),
+      inactive_reason: isActive ? null : inactive?.label ?? "Not available at this time",
+      on_pickup_side: onPickup || pickupNeighbours.has(zoneId),
+      on_destination_side: onDest || destNeighbours.has(zoneId),
+    });
+  }
+
+  for (const id of pickupNeighbours) {
+    addCandidate(id, true, destNeighbours.has(id));
+  }
+  for (const id of destNeighbours) {
+    if (!pickupNeighbours.has(id)) addCandidate(id, false, true);
+  }
+
+  const fullPickupIds = new Set(
+    [...pickupIdsRaw].filter((id) => allZonesById.has(id)),
+  );
+  const fullDestIds = new Set([...destIdsRaw].filter((id) => allZonesById.has(id)));
+  const fullEnumerated = enumerateChains(
+    Array.from(fullPickupIds),
+    fullDestIds,
+    fullAdjacency,
+    maxDepth,
+    extraHops,
+  );
+  const fullGraphConnected = fullEnumerated.chains.length > 0;
+
+  if (fullGraphConnected && !isActiveGraphConnected) {
+    for (const id of fullEnumerated.zoneIds) {
+      if (!activeZoneIds.has(id)) {
+        addCandidate(id, pickupNeighbours.has(id), destNeighbours.has(id));
+      }
+    }
+  }
+
+  const candidates = Array.from(candidateMap.values()).sort((a, b) => {
+    const aBoth = a.on_pickup_side && a.on_destination_side ? 0 : 1;
+    const bBoth = b.on_pickup_side && b.on_destination_side ? 0 : 1;
+    if (aBoth !== bBoth) return aBoth - bBoth;
+    if (a.schedule_active !== b.schedule_active) return a.schedule_active ? 1 : -1;
+    return `${a.transport_name} ${a.zone_name}`.localeCompare(
+      `${b.transport_name} ${b.zone_name}`,
+    );
+  });
+
+  const inactive = candidates.filter((c) => !c.schedule_active);
+  const activeNearGap = candidates.filter((c) => c.schedule_active);
+  const directBridge = candidates.filter(
+    (c) => c.on_pickup_side && c.on_destination_side,
+  );
+
+  let bridge_message: string;
+  if (candidates.length === 0) {
+    bridge_message =
+      "No transport zones in the network can bridge this gap — a new zone or connection is required.";
+  } else if (inactive.length > 0 && activeNearGap.length === 0) {
+    bridge_message =
+      inactive.length === 1
+        ? "1 zone could bridge this gap but is not available at this date and time."
+        : `${inactive.length} zones could bridge this gap but are not available at this date and time.`;
+  } else if (inactive.length > 0) {
+    bridge_message =
+      `${candidates.length} zone${candidates.length === 1 ? "" : "s"} near this gap; ` +
+      `${inactive.length} closed at this date & time.`;
+  } else if (directBridge.length > 0) {
+    bridge_message =
+      `${directBridge.length} zone${directBridge.length === 1 ? "" : "s"} connect both sides of the gap but the route is still incomplete — check zone connections.`;
+  } else {
+    bridge_message =
+      `${candidates.length} zone${candidates.length === 1 ? "" : "s"} exist near this gap but do not fully connect pickup to drop-off yet.`;
+  }
+
+  return { candidates, bridge_message };
+}
+
 /**
  * When no complete route exists, walk the graph from both ends to find:
  *  - how far the order can travel from the pickup side (the incomplete route),
@@ -898,9 +1046,19 @@ function nearestZonePair(
 async function buildGap(
   pickupIds: Set<number>,
   destIds: Set<number>,
-  adjacency: Map<number, { neighbour: number; connection: ConnectionRow }[]>,
+  adjacency: ZoneAdjacency,
   zoneById: Map<number, ZoneMeta>,
-  maxDepth: number
+  maxDepth: number,
+  ctx: {
+    fullAdjacency: ZoneAdjacency;
+    allZonesById: Map<number, ZoneMeta>;
+    activeZoneIds: Set<number>;
+    pickupIdsRaw: Set<number>;
+    destIdsRaw: Set<number>;
+    now: Date;
+    extraHops: number;
+    isActiveGraphConnected: boolean;
+  },
 ): Promise<OrderDraftGap | null> {
   const pickupBfs = bfsFromPickup(Array.from(pickupIds), adjacency, maxDepth);
   const destBfs = bfsFromPickup(Array.from(destIds), adjacency, maxDepth);
@@ -946,11 +1104,24 @@ async function buildGap(
     ? `${destFrontier.transport_name} · ${destFrontier.zone_name}`
     : `zone #${pair.to}`;
 
+  const { candidates: bridge_candidates, bridge_message } = buildGapBridgeCandidates(
+    pair.from,
+    pair.to,
+    ctx.fullAdjacency,
+    ctx.allZonesById,
+    ctx.activeZoneIds,
+    ctx.pickupIdsRaw,
+    ctx.destIdsRaw,
+    ctx.isActiveGraphConnected,
+    maxDepth,
+    ctx.extraHops,
+    ctx.now,
+  );
+
   const message =
     `No complete route yet. From the pickup the order can reach “${pickupLabel}”, ` +
     `which is the closest it gets — about ${km} km from “${destLabel}” on the ` +
-    `destination side. Add or extend a transport zone (or pick a transporter ` +
-    `covering both) to bridge this gap.`;
+    `destination side. ${bridge_message}`;
 
   return {
     pickup_frontier_zone_id: pair.from,
@@ -961,6 +1132,8 @@ async function buildGap(
     suggested_transport_name: destFrontier?.transport_name ?? pickupFrontier?.transport_name ?? null,
     suggested_zone_name: destFrontier?.zone_name ?? pickupFrontier?.zone_name ?? null,
     message,
+    bridge_candidates,
+    bridge_message,
   };
 }
 
@@ -1087,7 +1260,8 @@ export async function previewOrderZoneConnectionsByCoordinates(
     pickupIdsRaw,
     destIdsRaw,
     activeZoneIds,
-    allZonesById
+    allZonesById,
+    now,
   );
 
   const pickupIds = new Set([...pickupIdsRaw].filter((id) => activeZoneIds.has(id)));
@@ -1097,6 +1271,13 @@ export async function previewOrderZoneConnectionsByCoordinates(
   // Stale connection rows pointing at unavailable zones must not let BFS
   // claim a path that the UI can't render.
   const zoneById = new Map(zones.map((z) => [z.id, z]));
+  const fullZoneById = new Map(allZones.map((z) => [z.id, z]));
+  const fullZoneIdSet = new Set(fullZoneById.keys());
+  const fullConnections = allConnections.filter(
+    (c) => fullZoneIdSet.has(c.zone_a_id) && fullZoneIdSet.has(c.zone_b_id),
+  );
+  const fullAdjacency = buildAdjacency(fullConnections, fullZoneIdSet);
+
   const connections = allConnections.filter(
     (c) => zoneById.has(c.zone_a_id) && zoneById.has(c.zone_b_id)
   );
@@ -1110,13 +1291,10 @@ export async function previewOrderZoneConnectionsByCoordinates(
     if (!zoneById.has(id)) destIds.delete(id);
   });
 
-  const adjacency = new Map<number, { neighbour: number; connection: ConnectionRow }[]>();
-  for (const c of connections) {
-    if (!adjacency.has(c.zone_a_id)) adjacency.set(c.zone_a_id, []);
-    if (!adjacency.has(c.zone_b_id)) adjacency.set(c.zone_b_id, []);
-    adjacency.get(c.zone_a_id)!.push({ neighbour: c.zone_b_id, connection: c });
-    adjacency.get(c.zone_b_id)!.push({ neighbour: c.zone_a_id, connection: c });
-  }
+  const adjacency = buildAdjacency(
+    connections,
+    new Set(zoneById.keys()),
+  );
 
   const pickupZones = pickZones(pickupIds, zoneById);
   const destinationZones = pickZones(destIds, zoneById);
@@ -1141,7 +1319,16 @@ export async function previewOrderZoneConnectionsByCoordinates(
   // nearest gap a new/extended zone would need to close.
   const gap =
     !isConnected && pickupIds.size > 0 && destIds.size > 0
-      ? await buildGap(pickupIds, destIds, adjacency, zoneById, maxDepth)
+      ? await buildGap(pickupIds, destIds, adjacency, zoneById, maxDepth, {
+          fullAdjacency,
+          allZonesById,
+          activeZoneIds,
+          pickupIdsRaw,
+          destIdsRaw,
+          now,
+          extraHops,
+          isActiveGraphConnected: isConnected,
+        })
       : null;
 
   // Surface pickup + destination zones plus every zone that appears on a

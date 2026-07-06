@@ -235,6 +235,66 @@ export function formatZoneScheduleSummary(zone: ZoneScheduleFields): string | nu
   return `${datePart} · ${repeatPart} · ${timePart}`;
 }
 
+export type ZoneScheduleInactiveReason =
+  | "no_schedule"
+  | "outside_dates"
+  | "outside_weekday"
+  | "outside_month_day"
+  | "outside_hours";
+
+/** Human-readable explanation when a zone is not active at `now`. */
+export function describeZoneScheduleInactiveReason(
+  zone: ZoneScheduleFields,
+  now: Date = new Date(),
+): { reason: ZoneScheduleInactiveReason; label: string } | null {
+  if (!hasCompleteZoneSchedule(zone)) {
+    return { reason: "no_schedule", label: "No operating schedule configured" };
+  }
+  if (isZoneScheduleActive(zone, now)) return null;
+
+  const range = normalizeOperationDateRange(zone)!;
+  const today = dateToYmd(now);
+  if (!isDateWithinRange(today, range.start, range.end)) {
+    const datePart =
+      range.start === range.end ? range.start : `${range.start} – ${range.end}`;
+    return {
+      reason: "outside_dates",
+      label: `Outside operating dates (${datePart})`,
+    };
+  }
+
+  if (!matchesDayPattern(zone, now)) {
+    const pattern = parseSchedulePattern(zone.schedule_pattern);
+    const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    if (pattern === "weekly") {
+      const ws = zone.weekday_start;
+      const we = zone.weekday_end;
+      if (ws != null && we != null) {
+        const wsLabel = WEEKDAY_LABELS[ws] ?? String(ws);
+        const weLabel = WEEKDAY_LABELS[we] ?? String(we);
+        const days = ws === we ? wsLabel : `${wsLabel}–${weLabel}`;
+        return {
+          reason: "outside_weekday",
+          label: `Not operating today — runs ${days}`,
+        };
+      }
+      return { reason: "outside_weekday", label: "Not operating on this day of the week" };
+    }
+    return {
+      reason: "outside_month_day",
+      label: "Not operating on this day of the month",
+    };
+  }
+
+  const summary = formatZoneScheduleSummary(zone);
+  return {
+    reason: "outside_hours",
+    label: summary
+      ? `Not available now — outside operating hours (${summary})`
+      : "Not available now — outside operating hours",
+  };
+}
+
 export function normalizeTransportModeForSchedule(mode: string): TransportMode {
   const m = String(mode ?? "land").toLowerCase();
   return m === "air" || m === "sea" ? (m as TransportMode) : "land";

@@ -139,7 +139,26 @@ export interface ScheduleInactiveZoneSummary {
   zone_name: string;
   transport_name: string;
   schedule_summary: string | null;
+  inactive_reason: string | null;
   covers: "pickup" | "destination" | "both";
+}
+
+export interface GapBridgeCandidateSummary {
+  zone_id: number;
+  zone_name: string;
+  transport_name: string;
+  schedule_active: boolean;
+  schedule_summary: string | null;
+  inactive_reason: string | null;
+  on_pickup_side: boolean;
+  on_destination_side: boolean;
+}
+
+export interface OrderDraftGapSummary {
+  distance_km: number | null;
+  bridge_message: string | null;
+  bridge_candidates: GapBridgeCandidateSummary[];
+  message: string;
 }
 
 export interface OrderRouteCostComparisonResponse {
@@ -158,6 +177,8 @@ export interface OrderRouteCostComparisonResponse {
   route_lock_reason: "confirmed_route" | "delivery_in_progress" | null;
   schedule_inactive_zones: ScheduleInactiveZoneSummary[];
   route_schedule_at: string | null;
+  is_route_complete: boolean;
+  gap: OrderDraftGapSummary | null;
 }
 
 export interface AffectedRouteRef {

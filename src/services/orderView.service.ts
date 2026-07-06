@@ -1,5 +1,5 @@
 import { pool } from "../database";
-import type { RouteCostSummaryResponse } from "../models/routeCost.model";
+import type { RouteCostSummaryResponse, ScheduleInactiveZoneSummary } from "../models/routeCost.model";
 import type { RouteConfirmationStatusResponse } from "../models/routeConfirmation.model";
 import type { OrderResponse } from "../models/order.model";
 import type { TrackingStatus } from "../models/orderTracking.model";
@@ -55,9 +55,18 @@ export interface TransporterOrderViewItem {
     confirmation_status: string;
     cost_status: string;
     final_cost: number | null;
+    package_weight_lbs: number | null;
+    package_dimensions_in: string | null;
+    zone_schedule_active: boolean | null;
+    zone_schedule_summary: string | null;
+    zone_schedule_inactive_reason: string | null;
   }[];
   upstream_transporter: string | null;
   downstream_transporter: string | null;
+  package_type: string | null;
+  package_weight_lbs: number | null;
+  package_dimensions_in: string | null;
+  schedule_inactive_zones: ScheduleInactiveZoneSummary[];
 }
 
 export async function getSenderOrderView(
@@ -176,6 +185,10 @@ export async function getTransporterOrders(
         my_segments: [],
         upstream_transporter: null,
         downstream_transporter: null,
+        package_type: item.package_type ?? null,
+        package_weight_lbs: item.package_weight_lbs ?? null,
+        package_dimensions_in: item.package_dimensions_in ?? null,
+        schedule_inactive_zones: item.schedule_inactive_zones ?? [],
       });
     }
     const entry = byOrder.get(item.order_id)!;
@@ -194,6 +207,11 @@ export async function getTransporterOrders(
       confirmation_status: item.status,
       cost_status: String(sc?.cost_status ?? "missing"),
       final_cost: sc?.final_cost != null ? Number(sc.final_cost) : null,
+      package_weight_lbs: item.package_weight_lbs ?? null,
+      package_dimensions_in: item.package_dimensions_in ?? null,
+      zone_schedule_active: item.zone_schedule_active ?? null,
+      zone_schedule_summary: item.zone_schedule_summary ?? null,
+      zone_schedule_inactive_reason: item.zone_schedule_inactive_reason ?? null,
     });
   }
 

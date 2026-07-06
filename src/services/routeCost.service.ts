@@ -984,6 +984,9 @@ export async function calculateRouteCost(
   preservedManualByZoneSig?: Map<string, number>,
 ): Promise<RouteCostSummaryResponse> {
   const { order, route } = await assertRouteAccess(routeId, ctx);
+  if (route.is_complete === false) {
+    throw new RouteCostError("Cannot calculate cost for an incomplete route", 400);
+  }
   const zoneIds = parseJsonIntArray(route.zone_ids);
   const zoneMeta = await loadZoneMetaForIds(zoneIds);
   const zoneCoords = await loadZoneCentroids(zoneIds);
@@ -1345,6 +1348,9 @@ export async function getRouteCostSummary(
   ctx: OrderContext,
 ): Promise<RouteCostSummaryResponse> {
   const { order, route } = await assertRouteAccess(routeId, ctx);
+  if (route.is_complete === false) {
+    throw new RouteCostError("Cannot load cost for an incomplete route", 400);
+  }
 
   const segResult = await pool.query(
     `SELECT * FROM route_segment_costs WHERE route_id = $1 ORDER BY segment_index`,
@@ -1800,11 +1806,71 @@ async function resyncAndCostOrder(
   ctx: OrderContext,
   liveChains?: RouteChain[],
 ): Promise<void> {
+  const chains = liveChains ?? (await fetchLiveRouteChains(order));
+  if (chains.length === 0) {
+    await syncOrderRoutesFromPreview(order, []);
+    return;
+  }
   const preservedManual = await snapshotManualCosts(order.id);
-  const routeIds = await syncOrderRoutesFromPreview(order, liveChains);
+  const routeIds = await syncOrderRoutesFromPreview(order, chains);
   for (const routeId of routeIds) {
     await calculateRouteCost(routeId, ctx, preservedManual);
   }
+}
+
+async function loadOrderRouteConnectivity(orderRow: OrderResponse): Promise<{
+  isRouteComplete: boolean;
+  scheduleInactiveZones: OrderRouteCostComparisonResponse["schedule_inactive_zones"];
+  gapSummary: OrderRouteCostComparisonResponse["gap"];
+}> {
+  if (
+    orderRow.sender_lat == null ||
+    orderRow.sender_lng == null ||
+    orderRow.destination_lat == null ||
+    orderRow.destination_lng == null
+  ) {
+    return { isRouteComplete: true, scheduleInactiveZones: [], gapSummary: null };
+  }
+  try {
+    const preview = await previewOrderZoneConnectionsByCoordinates({
+      source_lat: orderRow.sender_lat,
+      source_lng: orderRow.sender_lng,
+      destination_lat: orderRow.destination_lat,
+      destination_lng: orderRow.destination_lng,
+      source_name: orderRow.source_name,
+      source_address: orderRow.sender_address,
+      destination_name: orderRow.receiver_name,
+      destination_address: orderRow.destination_address,
+      max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
+      schedule_at: orderRow.route_schedule_at ?? undefined,
+    });
+    return {
+      isRouteComplete: preview.is_connected_to_destination,
+      scheduleInactiveZones: preview.schedule_inactive_zones ?? [],
+      gapSummary: preview.gap
+        ? {
+            distance_km: preview.gap.distance_km,
+            bridge_message: preview.gap.bridge_message,
+            bridge_candidates: preview.gap.bridge_candidates ?? [],
+            message: preview.gap.message,
+          }
+        : null,
+    };
+  } catch {
+    return { isRouteComplete: true, scheduleInactiveZones: [], gapSummary: null };
+  }
+}
+
+function orderPackageFieldsForComparison(orderRow: OrderResponse) {
+  const dims =
+    orderRow.package_length != null &&
+    orderRow.package_width != null &&
+    orderRow.package_height != null
+      ? `${orderRow.package_length} × ${orderRow.package_width} × ${orderRow.package_height} in`
+      : orderRow.dimensions || null;
+  const weightLbs =
+    orderRow.weight_lbs != null ? Number(orderRow.weight_lbs) : null;
+  return { dims, weightLbs };
 }
 
 async function buildOrderRouteComparison(
@@ -1815,6 +1881,43 @@ async function buildOrderRouteComparison(
 ): Promise<OrderRouteCostComparisonResponse> {
   const orderRow = order ?? (await getOrderForCostAccess(orderId, ctx));
   const lockInfo = await getOrderRouteLockInfo(orderId);
+  const bookingFeeRate = await getBookingFeeRate();
+  const pffFactor = await getPffFactor();
+  const isPff = isPffPaymentMethod(orderRow.payment_method);
+  const { dims, weightLbs } = orderPackageFieldsForComparison(orderRow);
+
+  const connectivity = await loadOrderRouteConnectivity(orderRow);
+
+  if (!lockInfo.locked && !connectivity.isRouteComplete) {
+    const routesResult = await pool.query(
+      `SELECT id FROM order_routes WHERE order_id = $1 LIMIT 1`,
+      [orderId],
+    );
+    if ((routesResult.rowCount ?? 0) > 0) {
+      await syncOrderRoutesFromPreview(orderRow, []);
+    }
+
+    return {
+      order_id: orderId,
+      currency: "CAD",
+      booking_fee_rate: bookingFeeRate,
+      pff_factor: pffFactor,
+      is_pff_order: isPff,
+      package_type: orderRow.package_type,
+      packages: orderRow.packages,
+      package_factor: orderRow.package_factor,
+      package_weight_lbs: weightLbs,
+      package_dimensions_in: dims,
+      routes: [],
+      route_locked: false,
+      route_lock_reason: null,
+      schedule_inactive_zones: connectivity.scheduleInactiveZones,
+      route_schedule_at: orderRow.route_schedule_at ?? null,
+      is_route_complete: false,
+      gap: connectivity.gapSummary,
+    };
+  }
+
   const routesResult = await pool.query(
     `SELECT * FROM order_routes WHERE order_id = $1 ORDER BY route_index`,
     [orderId],
@@ -1845,9 +1948,6 @@ async function buildOrderRouteComparison(
   });
 
   const currency = routes[0]?.currency ?? "CAD";
-  const bookingFeeRate = await getBookingFeeRate();
-  const pffFactor = await getPffFactor();
-  const isPff = isPffPaymentMethod(orderRow.payment_method);
 
   if (isPff) {
     routes.sort((a, b) => {
@@ -1857,42 +1957,6 @@ async function buildOrderRouteComparison(
       return a.total_final_cost - b.total_final_cost;
     });
   }
-
-  let scheduleInactiveZones: OrderRouteCostComparisonResponse["schedule_inactive_zones"] =
-    [];
-  if (
-    orderRow.sender_lat != null &&
-    orderRow.sender_lng != null &&
-    orderRow.destination_lat != null &&
-    orderRow.destination_lng != null
-  ) {
-    try {
-      const preview = await previewOrderZoneConnectionsByCoordinates({
-        source_lat: orderRow.sender_lat,
-        source_lng: orderRow.sender_lng,
-        destination_lat: orderRow.destination_lat,
-        destination_lng: orderRow.destination_lng,
-        source_name: orderRow.source_name,
-        source_address: orderRow.sender_address,
-        destination_name: orderRow.receiver_name,
-        destination_address: orderRow.destination_address,
-        max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
-        schedule_at: orderRow.route_schedule_at ?? undefined,
-      });
-      scheduleInactiveZones = preview.schedule_inactive_zones ?? [];
-    } catch {
-      scheduleInactiveZones = [];
-    }
-  }
-
-  const dims =
-    orderRow.package_length != null &&
-    orderRow.package_width != null &&
-    orderRow.package_height != null
-      ? `${orderRow.package_length} × ${orderRow.package_width} × ${orderRow.package_height} in`
-      : orderRow.dimensions || null;
-  const weightLbs =
-    orderRow.weight_lbs != null ? Number(orderRow.weight_lbs) : null;
 
   return {
     order_id: orderId,
@@ -1908,8 +1972,10 @@ async function buildOrderRouteComparison(
     routes,
     route_locked: lockInfo.locked,
     route_lock_reason: lockInfo.reason,
-    schedule_inactive_zones: scheduleInactiveZones,
+    schedule_inactive_zones: connectivity.scheduleInactiveZones,
     route_schedule_at: orderRow.route_schedule_at ?? null,
+    is_route_complete: connectivity.isRouteComplete,
+    gap: connectivity.gapSummary,
   };
 }
 
@@ -1939,6 +2005,10 @@ export async function recalculateRouteCostsForOrder(
 
   const liveChains = await withOrderResyncLock(order.id, async () => {
     const chains = await fetchLiveRouteChains(order);
+    if (chains.length === 0) {
+      await syncOrderRoutesFromPreview(order, []);
+      return chains;
+    }
     await resyncAndCostOrder(order, ctx, chains);
     return chains;
   });
@@ -1957,10 +2027,6 @@ export async function compareOrderRoutes(
     );
   }
 
-  if (isPffPaymentMethod(order.payment_method)) {
-    await ensurePffRouteSegmentsForOrder(orderId, ctx);
-  }
-
   const lockInfo = await getOrderRouteLockInfo(order.id);
 
   if (lockInfo.locked) {
@@ -1968,12 +2034,31 @@ export async function compareOrderRoutes(
   }
 
   let liveChains = await fetchLiveRouteChains(order);
+
+  if (liveChains.length === 0) {
+    if (await orderRoutesNeedResync(order, liveChains)) {
+      await withOrderResyncLock(order.id, async () => {
+        if (await isOrderRouteLocked(order.id)) return;
+        await syncOrderRoutesFromPreview(order, []);
+      });
+    }
+    return buildOrderRouteComparison(orderId, ctx, liveChains, order);
+  }
+
+  if (isPffPaymentMethod(order.payment_method)) {
+    await ensurePffRouteSegmentsForOrder(orderId, ctx);
+  }
+
   if (await orderRoutesNeedResync(order, liveChains)) {
     liveChains = await withOrderResyncLock(order.id, async () => {
       if (await isOrderRouteLocked(order.id)) {
         return fetchLiveRouteChains(order);
       }
       const freshChains = await fetchLiveRouteChains(order);
+      if (freshChains.length === 0) {
+        await syncOrderRoutesFromPreview(order, []);
+        return freshChains;
+      }
       if (await orderRoutesNeedResync(order, freshChains)) {
         await resyncAndCostOrder(order, ctx, freshChains);
       }

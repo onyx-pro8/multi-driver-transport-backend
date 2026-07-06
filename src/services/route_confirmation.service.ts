@@ -20,6 +20,19 @@ import {
   calculateRouteCost,
   getRouteCostSummary,
 } from "./routeCost.service";
+import type { ScheduleInactiveZoneSummary } from "../models/routeCost.model";
+import {
+  DEFAULT_PREVIEW_MAX_DEPTH,
+  previewOrderZoneConnectionsByCoordinates,
+} from "./orderZoneConnection.service";
+import {
+  buildZoneScheduleFields,
+  describeZoneScheduleInactiveReason,
+  formatZoneScheduleSummary,
+  hasCompleteZoneSchedule,
+  isZoneScheduleActive,
+  parseScheduleFromRow,
+} from "./zoneSchedule.service";
 
 export class RouteConfirmationError extends Error {
   status: number;
@@ -445,6 +458,106 @@ export async function getSelectedRoute(
   };
 }
 
+function formatOrderPackageDimensions(row: Record<string, unknown>): string | null {
+  if (
+    row.package_length != null &&
+    row.package_width != null &&
+    row.package_height != null
+  ) {
+    return `${row.package_length} × ${row.package_width} × ${row.package_height} in`;
+  }
+  const dims = row.dimensions;
+  return dims != null && String(dims).trim() !== "" ? String(dims) : null;
+}
+
+async function loadZoneScheduleStatusByIds(
+  zoneIds: number[],
+): Promise<Map<number, { active: boolean | null; summary: string | null; inactive_reason: string | null }>> {
+  const unique = Array.from(new Set(zoneIds.filter((id) => id > 0)));
+  const map = new Map<number, { active: boolean | null; summary: string | null; inactive_reason: string | null }>();
+  if (unique.length === 0) return map;
+
+  const result = await pool.query(
+    `SELECT id, transport_mode, operation_date, operation_start_date, operation_end_date,
+            schedule_pattern, weekday_start, weekday_end, month_day_start, month_day_end,
+            operating_start_time, operating_end_time, departure_time, arrival_time
+     FROM driver_zones WHERE id = ANY($1::int[])`,
+    [unique],
+  );
+
+  for (const row of result.rows) {
+    const id = Number(row.id);
+    const schedule = parseScheduleFromRow(row);
+    const fields = buildZoneScheduleFields({
+      transport_mode: String(row.transport_mode ?? "land"),
+      ...schedule,
+    });
+    if (!hasCompleteZoneSchedule(fields)) {
+      map.set(id, {
+        active: null,
+        summary: null,
+        inactive_reason: "No operating schedule configured",
+      });
+      continue;
+    }
+    const active = isZoneScheduleActive(fields);
+    const inactive = describeZoneScheduleInactiveReason(fields);
+    map.set(id, {
+      active,
+      summary: formatZoneScheduleSummary(fields),
+      inactive_reason: active ? null : inactive?.label ?? "Not available at this time",
+    });
+  }
+  return map;
+}
+
+async function ensureZoneScheduleCached(
+  zoneIds: number[],
+  cache: Map<number, { active: boolean | null; summary: string | null; inactive_reason: string | null }>,
+): Promise<void> {
+  const missing = zoneIds.filter((id) => id > 0 && !cache.has(id));
+  if (missing.length === 0) return;
+  const statusMap = await loadZoneScheduleStatusByIds(missing);
+  for (const id of missing) {
+    cache.set(id, statusMap.get(id) ?? { active: null, summary: null, inactive_reason: null });
+  }
+}
+
+async function loadScheduleInactiveZonesForOrder(
+  row: Record<string, unknown>,
+): Promise<ScheduleInactiveZoneSummary[]> {
+  if (
+    row.sender_lat == null ||
+    row.sender_lng == null ||
+    row.destination_lat == null ||
+    row.destination_lng == null
+  ) {
+    return [];
+  }
+  try {
+    const preview = await previewOrderZoneConnectionsByCoordinates({
+      source_lat: Number(row.sender_lat),
+      source_lng: Number(row.sender_lng),
+      destination_lat: Number(row.destination_lat),
+      destination_lng: Number(row.destination_lng),
+      source_name: row.source_name != null ? String(row.source_name) : undefined,
+      source_address: row.sender_address != null ? String(row.sender_address) : undefined,
+      destination_name:
+        row.receiver_name != null ? String(row.receiver_name) : undefined,
+      destination_address:
+        row.destination_address != null ? String(row.destination_address) : undefined,
+      max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
+      schedule_at:
+        row.route_schedule_at != null
+          ? new Date(String(row.route_schedule_at)).toISOString()
+          : undefined,
+    });
+    return preview.schedule_inactive_zones ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export async function listTransporterConfirmations(
   ctx: OrderContext
 ): Promise<TransporterConfirmationItem[]> {
@@ -493,6 +606,20 @@ export async function listTransporterConfirmations(
             o.pickup_ready_at,
             o.goods_ready_at,
             o.payment_method,
+            o.weight_lbs,
+            o.package_length,
+            o.package_width,
+            o.package_height,
+            o.dimensions,
+            o.package_type,
+            o.sender_lat,
+            o.sender_lng,
+            o.destination_lat,
+            o.destination_lng,
+            o.source_name,
+            ru.full_name AS receiver_name,
+            o.route_schedule_at,
+            r.is_complete AS route_is_complete,
             rs.status AS route_selection_status,
             (
               SELECT COUNT(*)::int
@@ -516,6 +643,7 @@ export async function listTransporterConfirmations(
      JOIN order_routes r ON r.id = sc.route_id
      JOIN route_segment_costs rsc ON rsc.id = sc.segment_id
      JOIN orders o ON o.id = r.order_id
+     JOIN users ru ON ru.id = o.receiver_user_id
      LEFT JOIN route_selections rs ON rs.order_id = r.order_id AND rs.selected_route_id = r.id
      LEFT JOIN route_confirmation_requests rcr ON rcr.segment_id = sc.segment_id
      WHERE sc.transporter_id = $1
@@ -524,10 +652,13 @@ export async function listTransporterConfirmations(
   );
 
   const summaryCache = new Map<number, Awaited<ReturnType<typeof getRouteCostSummary>>>();
+  const scheduleInactiveCache = new Map<number, ScheduleInactiveZoneSummary[]>();
+  const zoneScheduleCache = new Map<number, { active: boolean | null; summary: string | null; inactive_reason: string | null }>();
 
   const items: TransporterConfirmationItem[] = [];
   for (const row of result.rows) {
     const routeId = Number(row.route_id);
+    const orderId = Number(row.order_id);
     if (!summaryCache.has(routeId)) {
       try {
         summaryCache.set(routeId, await getRouteCostSummary(routeId, ctx));
@@ -538,6 +669,22 @@ export async function listTransporterConfirmations(
     }
     const summary = summaryCache.get(routeId)!;
     const seg = summary.segments.find((s) => s.segment_id === Number(row.segment_id));
+    const zoneId = seg?.zone_id ?? null;
+
+    if (!scheduleInactiveCache.has(orderId)) {
+      scheduleInactiveCache.set(
+        orderId,
+        await loadScheduleInactiveZonesForOrder(row),
+      );
+    }
+
+    if (zoneId != null) {
+      await ensureZoneScheduleCached([zoneId], zoneScheduleCache);
+    }
+    const zoneSchedule =
+      zoneId != null
+        ? zoneScheduleCache.get(zoneId) ?? { active: null, summary: null, inactive_reason: null }
+        : { active: null, summary: null, inactive_reason: null };
 
     items.push({
       confirmation_id: Number(row.confirmation_id),
@@ -585,6 +732,16 @@ export async function listTransporterConfirmations(
       final_cost: seg?.final_cost ?? null,
       currency: seg?.currency ?? "CAD",
       cost_status: seg?.cost_status ?? "missing",
+      package_type: row.package_type != null ? String(row.package_type) : null,
+      package_weight_lbs:
+        row.weight_lbs != null ? Number(row.weight_lbs) : null,
+      package_dimensions_in: formatOrderPackageDimensions(row),
+      route_is_complete: row.route_is_complete !== false,
+      schedule_inactive_zones: scheduleInactiveCache.get(orderId) ?? [],
+      zone_id: zoneId,
+      zone_schedule_active: zoneSchedule.active,
+      zone_schedule_summary: zoneSchedule.summary,
+      zone_schedule_inactive_reason: zoneSchedule.inactive_reason,
     });
   }
 

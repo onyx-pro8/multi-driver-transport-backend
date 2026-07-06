@@ -1,5 +1,5 @@
 import type { TrackingStatus } from "./orderTracking.model";
-import type { SegmentCostStatus } from "./routeCost.model";
+import type { ScheduleInactiveZoneSummary, SegmentCostStatus } from "./routeCost.model";
 
 export const ROUTE_SELECTION_STATUSES = [
   "pending",
@@ -121,4 +121,13 @@ export interface TransporterConfirmationItem {
   final_cost: number | null;
   currency: string;
   cost_status: SegmentCostStatus;
+  package_type: string | null;
+  package_weight_lbs: number | null;
+  package_dimensions_in: string | null;
+  route_is_complete: boolean;
+  schedule_inactive_zones: ScheduleInactiveZoneSummary[];
+  zone_id: number | null;
+  zone_schedule_active: boolean | null;
+  zone_schedule_summary: string | null;
+  zone_schedule_inactive_reason: string | null;
 }
