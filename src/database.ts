@@ -792,6 +792,50 @@ export async function ensureSchema(): Promise<void> {
       `ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_pickup_notified_at TIMESTAMPTZ;`
     );
 
+    // Dual-route PFF: independent payment (receiver→sender) and goods (sender→receiver) paths.
+    await client.query(
+      `ALTER TABLE order_routes ADD COLUMN IF NOT EXISTS route_purpose TEXT;`
+    );
+    await client.query(
+      `ALTER TABLE order_routes DROP CONSTRAINT IF EXISTS order_routes_route_purpose_check;`
+    );
+    await client.query(
+      `ALTER TABLE order_routes ADD CONSTRAINT order_routes_route_purpose_check
+         CHECK (route_purpose IS NULL OR route_purpose IN ('payment', 'goods'));`
+    );
+    await client.query(
+      `ALTER TABLE route_selections ADD COLUMN IF NOT EXISTS route_purpose TEXT NOT NULL DEFAULT 'standard';`
+    );
+    await client.query(
+      `ALTER TABLE route_selections DROP CONSTRAINT IF EXISTS route_selections_order_unique;`
+    );
+    await client.query(
+      `ALTER TABLE route_selections DROP CONSTRAINT IF EXISTS route_selections_route_purpose_check;`
+    );
+    await client.query(
+      `ALTER TABLE route_selections ADD CONSTRAINT route_selections_route_purpose_check
+         CHECK (route_purpose IN ('standard', 'payment', 'goods'));`
+    );
+    await client.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_route_selections_order_purpose
+         ON route_selections (order_id, route_purpose);`
+    );
+    await client.query(
+      `ALTER TABLE order_routes DROP CONSTRAINT IF EXISTS order_routes_unique;`
+    );
+    await client.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_order_routes_order_purpose_index
+         ON order_routes (order_id, COALESCE(route_purpose, ''), route_index);`
+    );
+    await client.query(`ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_tracking_status_check;`);
+    await client.query(
+      `ALTER TABLE orders ADD CONSTRAINT orders_tracking_status_check
+         CHECK (tracking_status IN (
+           'AWAITING_CONNECT', 'REJECTED', 'CONFIRMED', 'ROUTES_IN_PROGRESS', 'ROUTES_READY',
+           'PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'PAYMENT_DELIVERED', 'DELIVERED'
+         ));`
+    );
+
     await client.query(`
       CREATE TABLE IF NOT EXISTS user_notifications (
         id         SERIAL PRIMARY KEY,

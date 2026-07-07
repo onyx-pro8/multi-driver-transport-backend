@@ -12,6 +12,9 @@ export type RouteSelectionStatus = (typeof ROUTE_SELECTION_STATUSES)[number];
 export const PAYMENT_STATUSES = ["pending", "ready", "not_required"] as const;
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 
+export const ROUTE_PURPOSES = ["standard", "payment", "goods"] as const;
+export type RoutePurpose = (typeof ROUTE_PURPOSES)[number];
+
 export const SEGMENT_LEG_STATUSES = ["not_started", "picked_up", "in_transit"] as const;
 export type SegmentLegStatus = (typeof SEGMENT_LEG_STATUSES)[number];
 
@@ -32,6 +35,7 @@ export interface RouteSelectionRow {
   selected_by_user_id: number;
   status: RouteSelectionStatus;
   payment_status: PaymentStatus;
+  route_purpose: RoutePurpose;
   created_at: Date;
   updated_at: Date;
 }
@@ -89,9 +93,16 @@ export interface RouteSelectionResponse {
   selected_by_user_id: number;
   status: RouteSelectionStatus;
   payment_status: PaymentStatus;
+  route_purpose: RoutePurpose;
   route_label: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface PffRouteSelectionsResponse {
+  payment: RouteSelectionResponse | null;
+  goods: RouteSelectionResponse | null;
+  both_confirmed: boolean;
 }
 
 export interface TransporterConfirmationItem {

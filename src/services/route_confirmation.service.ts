@@ -4,6 +4,8 @@ import type {
   RouteConfirmationStatusResponse,
   RouteSelectionResponse,
   RouteSelectionStatus,
+  RoutePurpose,
+  PffRouteSelectionsResponse,
   SegmentConfirmationDetail,
   SegmentConfirmationStatus,
   TransporterConfirmationItem,
@@ -79,25 +81,126 @@ function computeSelectionStatus(
   return "pending";
 }
 
+function mapSelectionRow(row: Record<string, unknown>): RouteSelectionResponse {
+  return {
+    id: Number(row.id),
+    order_id: Number(row.order_id),
+    selected_route_id: Number(row.selected_route_id),
+    selected_by_user_id: Number(row.selected_by_user_id),
+    status: String(row.status) as RouteSelectionStatus,
+    payment_status: String(row.payment_status) as "pending" | "ready" | "not_required",
+    route_purpose: String(row.route_purpose ?? "standard") as RoutePurpose,
+    route_label: String(row.route_label),
+    created_at: new Date(row.created_at as string | Date).toISOString(),
+    updated_at: new Date(row.updated_at as string | Date).toISOString(),
+  };
+}
+
+function assertRoutePurposeAccess(
+  routePurpose: RoutePurpose | null,
+  ctx: OrderContext,
+  senderId: number,
+  receiverId: number,
+): void {
+  if (ctx.role === "admin") return;
+  if (routePurpose === "payment" && ctx.userId !== receiverId) {
+    throw new RouteConfirmationError("Only the receiver can select the payment route", 403);
+  }
+  if (routePurpose === "goods" && ctx.userId !== senderId) {
+    throw new RouteConfirmationError("Only the sender can select the goods route", 403);
+  }
+}
+
+async function getPffSelectionsFromDb(
+  orderId: number,
+): Promise<{ payment: RouteSelectionResponse | null; goods: RouteSelectionResponse | null }> {
+  const result = await pool.query(
+    `SELECT rs.*, r.route_label
+     FROM route_selections rs
+     JOIN order_routes r ON r.id = rs.selected_route_id
+     WHERE rs.order_id = $1 AND rs.route_purpose IN ('payment', 'goods')`,
+    [orderId],
+  );
+  let payment: RouteSelectionResponse | null = null;
+  let goods: RouteSelectionResponse | null = null;
+  for (const row of result.rows) {
+    const mapped = mapSelectionRow(row);
+    if (mapped.route_purpose === "payment") payment = mapped;
+    if (mapped.route_purpose === "goods") goods = mapped;
+  }
+  return { payment, goods };
+}
+
+async function tryFinalizePffOrder(orderId: number): Promise<void> {
+  const { payment, goods } = await getPffSelectionsFromDb(orderId);
+  const paymentOk = payment?.status === "confirmed";
+  const goodsOk = goods?.status === "confirmed";
+
+  if (paymentOk && goodsOk) {
+    await pool.query(
+      `UPDATE orders SET tracking_status = 'ROUTES_READY', updated_at = NOW() WHERE id = $1`,
+      [orderId],
+    );
+    await addStatusHistory(orderId, "ROUTES_READY", null);
+    void notifyOrderParticipants({
+      order_id: orderId,
+      type: "route_confirmed",
+      title: "Both routes confirmed",
+      body: `Payment and goods routes are fully confirmed for shipment #${orderId}. Payment pickup can be scheduled when ready.`,
+    }).catch((err) => console.error("[notifications] pff_routes_ready failed:", err));
+    return;
+  }
+
+  if (payment || goods) {
+    await pool.query(
+      `UPDATE orders
+       SET tracking_status = 'ROUTES_IN_PROGRESS', updated_at = NOW()
+       WHERE id = $1 AND tracking_status = 'CONFIRMED'`,
+      [orderId],
+    );
+  }
+}
+
 export async function selectRoute(
   orderId: number,
   routeId: number,
   userId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<RouteSelectionResponse> {
-  await assertSenderReceiverAccess(orderId, ctx);
+  const { senderId, receiverId } = await assertSenderReceiverAccess(orderId, ctx);
 
   if (await isOrderRouteLocked(orderId)) {
     throw new RouteConfirmationError(
       "Cannot change route after confirmation or while delivery is in progress",
-      409
+      409,
     );
   }
 
   const route = await loadRouteForOrder(routeId, orderId);
   if (!route) throw new RouteConfirmationError("Route not found for this order", 404);
 
-  // Ensure segment costs exist before confirmation flow.
+  const order = await getOrderById(orderId, ctx);
+  if (!order) throw new RouteConfirmationError("Order not found", 404);
+
+  const isPff = isPffPaymentMethod(order.payment_method);
+  const routePurposeRaw =
+    route.route_purpose != null ? String(route.route_purpose) : null;
+
+  let selectionPurpose: RoutePurpose = "standard";
+  if (isPff) {
+    if (routePurposeRaw === "payment") selectionPurpose = "payment";
+    else if (routePurposeRaw === "goods") selectionPurpose = "goods";
+    else {
+      throw new RouteConfirmationError(
+        "PFF orders require selecting a payment or goods route candidate",
+        400,
+      );
+    }
+    assertRoutePurposeAccess(selectionPurpose, ctx, senderId, receiverId);
+  } else if (ctx.role !== "admin" && ctx.userId !== senderId && ctx.userId !== receiverId) {
+    throw new RouteConfirmationError("Forbidden", 403);
+  }
+
   await calculateRouteCost(routeId, ctx);
 
   const client = await pool.connect();
@@ -105,15 +208,16 @@ export async function selectRoute(
     await client.query("BEGIN");
 
     await client.query(
-      `INSERT INTO route_selections (order_id, selected_route_id, selected_by_user_id, status, payment_status)
-       VALUES ($1, $2, $3, 'pending', 'pending')
-       ON CONFLICT (order_id) DO UPDATE
+      `INSERT INTO route_selections
+         (order_id, selected_route_id, selected_by_user_id, status, payment_status, route_purpose)
+       VALUES ($1, $2, $3, 'pending', 'pending', $4)
+       ON CONFLICT (order_id, route_purpose) DO UPDATE
          SET selected_route_id = EXCLUDED.selected_route_id,
              selected_by_user_id = EXCLUDED.selected_by_user_id,
              status = 'pending',
              payment_status = 'pending',
              updated_at = NOW()`,
-      [orderId, routeId, userId]
+      [orderId, routeId, userId, selectionPurpose],
     );
 
     await client.query("COMMIT");
@@ -126,9 +230,21 @@ export async function selectRoute(
 
   await sendConfirmationToTransporters(routeId, ctx);
 
-  const selection = await getSelectedRoute(orderId, ctx);
-  if (!selection) throw new RouteConfirmationError("Failed to load route selection", 500);
-  return selection;
+  if (isPff) {
+    await tryFinalizePffOrder(orderId);
+  }
+
+  const selections = await getRouteSelections(orderId, ctx);
+  if (isPff) {
+    const picked =
+      selectionPurpose === "payment" ? selections.payment : selections.goods;
+    if (!picked) throw new RouteConfirmationError("Failed to load route selection", 500);
+    return picked;
+  }
+  if (!selections.standard) {
+    throw new RouteConfirmationError("Failed to load route selection", 500);
+  }
+  return selections.standard;
 }
 
 export async function sendConfirmationToTransporters(
@@ -191,10 +307,11 @@ export async function sendConfirmationToTransporters(
     }
 
     await client.query(
-      `UPDATE route_selections
+      `UPDATE route_selections rs
        SET status = 'pending', updated_at = NOW()
-       WHERE order_id = $1 AND selected_route_id = $2`,
-      [orderId, routeId]
+       FROM order_routes r
+       WHERE r.id = $1 AND rs.selected_route_id = r.id AND rs.order_id = r.order_id`,
+      [routeId],
     );
 
     await client.query("COMMIT");
@@ -262,6 +379,26 @@ export async function confirmSegment(
   return getRouteConfirmationStatus(routeId, ctx);
 }
 
+async function downgradePffOrderAfterRejection(orderId: number): Promise<void> {
+  const orderResult = await pool.query(
+    `SELECT payment_method, tracking_status FROM orders WHERE id = $1`,
+    [orderId],
+  );
+  if (orderResult.rowCount === 0) return;
+  if (!isPffPaymentMethod(String(orderResult.rows[0].payment_method ?? ""))) return;
+
+  const tracking = String(orderResult.rows[0].tracking_status ?? "");
+  if (tracking !== "ROUTES_READY" && tracking !== "ROUTES_IN_PROGRESS") return;
+
+  await pool.query(
+    `UPDATE orders
+     SET tracking_status = 'ROUTES_IN_PROGRESS', updated_at = NOW()
+     WHERE id = $1 AND tracking_status IN ('ROUTES_READY', 'ROUTES_IN_PROGRESS')`,
+    [orderId],
+  );
+  await addStatusHistory(orderId, "ROUTES_IN_PROGRESS", null);
+}
+
 export async function rejectSegment(
   segmentId: number,
   transporterId: number,
@@ -293,7 +430,7 @@ export async function rejectSegment(
      SET status = 'rejected', payment_status = 'not_required', updated_at = NOW()
      FROM order_routes r
      WHERE r.id = $1 AND rs.selected_route_id = r.id AND rs.order_id = r.order_id`,
-    [routeId]
+    [routeId],
   );
 
   const orderId = Number(seg.order_id);
@@ -305,6 +442,8 @@ export async function rejectSegment(
     body: `A transporter rejected a segment on shipment #${orderId}.${reasonText}`,
     exclude_user_id: ctx.userId,
   }).catch((err) => console.error("[notifications] segment_rejected failed:", err));
+
+  await downgradePffOrderAfterRejection(orderId);
 
   return getRouteConfirmationStatus(routeId, ctx);
 }
@@ -356,7 +495,7 @@ export async function getRouteConfirmationStatus(
 
   const selResult = await pool.query(
     `SELECT status, payment_status FROM route_selections WHERE selected_route_id = $1`,
-    [routeId]
+    [routeId],
   );
   const selection_status = (
     selResult.rowCount ? String(selResult.rows[0].status) : computeSelectionStatus(segments)
@@ -384,25 +523,45 @@ export async function getRouteConfirmationStatus(
 export async function finalizeRouteIfAllConfirmed(routeId: number): Promise<void> {
   const confResult = await pool.query(
     `SELECT status FROM segment_confirmations WHERE route_id = $1`,
-    [routeId]
+    [routeId],
   );
   if (confResult.rowCount === 0) return;
 
   const statuses = confResult.rows.map((r) => String(r.status) as SegmentConfirmationStatus);
   const selectionStatus = computeSelectionStatus(
-    statuses.map((status) => ({ status }))
+    statuses.map((status) => ({ status })),
   );
 
   const paymentStatus =
-    selectionStatus === "confirmed" ? "ready" : selectionStatus === "rejected" ? "not_required" : "pending";
+    selectionStatus === "confirmed"
+      ? "ready"
+      : selectionStatus === "rejected"
+        ? "not_required"
+        : "pending";
 
   await pool.query(
     `UPDATE route_selections rs
      SET status = $2, payment_status = $3, updated_at = NOW()
      FROM order_routes r
      WHERE r.id = $1 AND rs.selected_route_id = r.id AND rs.order_id = r.order_id`,
-    [routeId, selectionStatus, paymentStatus]
+    [routeId, selectionStatus, paymentStatus],
   );
+
+  const orderResult = await pool.query(
+    `SELECT r.order_id, o.payment_method
+     FROM order_routes r
+     JOIN orders o ON o.id = r.order_id
+     WHERE r.id = $1`,
+    [routeId],
+  );
+  if (!orderResult.rowCount) return;
+  const orderId = Number(orderResult.rows[0].order_id);
+  const isPff = isPffPaymentMethod(String(orderResult.rows[0].payment_method ?? ""));
+
+  if (isPff) {
+    await tryFinalizePffOrder(orderId);
+    return;
+  }
 
   if (selectionStatus === "confirmed") {
     await pool.query(
@@ -410,29 +569,22 @@ export async function finalizeRouteIfAllConfirmed(routeId: number): Promise<void
        SET tracking_status = 'CONFIRMED', updated_at = NOW()
        FROM order_routes r
        WHERE r.id = $1 AND o.id = r.order_id`,
-      [routeId]
+      [routeId],
     );
-    const orderResult = await pool.query(
-      `SELECT order_id FROM order_routes WHERE id = $1`,
-      [routeId]
-    );
-    if (orderResult.rowCount) {
-      const orderId = Number(orderResult.rows[0].order_id);
-      await addStatusHistory(orderId, "CONFIRMED", null);
-      void notifyOrderParticipants({
-        order_id: orderId,
-        type: "route_confirmed",
-        title: "Route fully confirmed",
-        body: `All transporters confirmed their segments for shipment #${orderId}. Pickup can be scheduled when ready.`,
-      }).catch((err) => console.error("[notifications] route_confirmed failed:", err));
-    }
+    await addStatusHistory(orderId, "CONFIRMED", null);
+    void notifyOrderParticipants({
+      order_id: orderId,
+      type: "route_confirmed",
+      title: "Route fully confirmed",
+      body: `All transporters confirmed their segments for shipment #${orderId}. Pickup can be scheduled when ready.`,
+    }).catch((err) => console.error("[notifications] route_confirmed failed:", err));
   }
 }
 
-export async function getSelectedRoute(
+export async function getRouteSelections(
   orderId: number,
-  ctx: OrderContext
-): Promise<RouteSelectionResponse | null> {
+  ctx: OrderContext,
+): Promise<PffRouteSelectionsResponse & { standard: RouteSelectionResponse | null }> {
   const order = await getOrderById(orderId, ctx);
   if (!order) throw new RouteConfirmationError("Order not found", 404);
 
@@ -441,21 +593,40 @@ export async function getSelectedRoute(
      FROM route_selections rs
      JOIN order_routes r ON r.id = rs.selected_route_id
      WHERE rs.order_id = $1`,
-    [orderId]
+    [orderId],
   );
-  if (result.rowCount === 0) return null;
-  const row = result.rows[0];
+
+  let standard: RouteSelectionResponse | null = null;
+  let payment: RouteSelectionResponse | null = null;
+  let goods: RouteSelectionResponse | null = null;
+
+  for (const row of result.rows) {
+    const mapped = mapSelectionRow(row);
+    if (mapped.route_purpose === "payment") payment = mapped;
+    else if (mapped.route_purpose === "goods") goods = mapped;
+    else standard = mapped;
+  }
+
   return {
-    id: Number(row.id),
-    order_id: Number(row.order_id),
-    selected_route_id: Number(row.selected_route_id),
-    selected_by_user_id: Number(row.selected_by_user_id),
-    status: String(row.status) as RouteSelectionStatus,
-    payment_status: String(row.payment_status) as "pending" | "ready" | "not_required",
-    route_label: String(row.route_label),
-    created_at: new Date(row.created_at).toISOString(),
-    updated_at: new Date(row.updated_at).toISOString(),
+    standard,
+    payment,
+    goods,
+    both_confirmed: payment?.status === "confirmed" && goods?.status === "confirmed",
   };
+}
+
+export async function getSelectedRoute(
+  orderId: number,
+  ctx: OrderContext,
+): Promise<RouteSelectionResponse | null> {
+  const selections = await getRouteSelections(orderId, ctx);
+  const order = await getOrderById(orderId, ctx);
+  if (!order) throw new RouteConfirmationError("Order not found", 404);
+
+  if (isPffPaymentMethod(order.payment_method)) {
+    return selections.payment ?? selections.goods;
+  }
+  return selections.standard;
 }
 
 function formatOrderPackageDimensions(row: Record<string, unknown>): string | null {

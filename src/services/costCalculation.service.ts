@@ -22,7 +22,8 @@ export interface DerivedSegment {
   from_zone_id: number | null;
   to_zone_id: number | null;
   zone_ids: number[];
-  /** PFF round-trip: payment (receiver→sender) or goods (sender→receiver). */
+  /** PFF payment route: receiver → sender (receiver sends payment to producer). */
+  /** PFF goods route: sender → receiver. */
   leg_phase?: PffLegPhase | null;
   /** Producer handoff: same transporter delivers payment then collects goods. */
   handoff_role?: PffHandoffRole | null;
@@ -452,6 +453,10 @@ function deriveForwardSegments(
 
     const isGoodsHandoff =
       options.legPhase === "goods" && i === 0 && options.startNode === "sender";
+    const isPaymentHandoff =
+      options.legPhase === "payment" &&
+      i === zoneIds.length - 1 &&
+      options.endNode === "sender";
 
     segments.push({
       segment_index: options.indexOffset + segments.length,
@@ -463,13 +468,53 @@ function deriveForwardSegments(
       to_zone_id: zoneId,
       zone_ids: [zoneId],
       leg_phase: options.legPhase,
-      handoff_role: isGoodsHandoff ? "goods_pickup" : null,
+      handoff_role: isPaymentHandoff
+        ? "payment_delivery"
+        : isGoodsHandoff
+          ? "goods_pickup"
+          : null,
       forward_zone_index: i,
     });
   }
   return segments;
 }
 
+export type RouteSegmentPurpose = "standard" | "payment" | "goods";
+
+export function deriveSegmentsFromRoute(
+  zoneIds: number[],
+  zoneMeta: Map<number, { owner_user_id: number; transport_mode: string | null }>,
+  routePurpose: RouteSegmentPurpose = "standard",
+): DerivedSegment[] {
+  if (zoneIds.length === 0) return [];
+
+  if (routePurpose === "payment") {
+    return deriveForwardSegments(zoneIds, zoneMeta, {
+      indexOffset: 0,
+      legPhase: "payment",
+      startNode: "receiver",
+      endNode: "sender",
+    });
+  }
+
+  if (routePurpose === "goods") {
+    return deriveForwardSegments(zoneIds, zoneMeta, {
+      indexOffset: 0,
+      legPhase: "goods",
+      startNode: "sender",
+      endNode: "receiver",
+    });
+  }
+
+  return deriveForwardSegments(zoneIds, zoneMeta, {
+    indexOffset: 0,
+    legPhase: null,
+    startNode: "sender",
+    endNode: "receiver",
+  });
+}
+
+/** @deprecated Legacy doubled-route PFF — use separate payment/goods routes instead. */
 function deriveReversePaymentSegments(
   zoneIds: number[],
   zoneMeta: Map<number, { owner_user_id: number; transport_mode: string | null }>,
@@ -505,36 +550,10 @@ function deriveReversePaymentSegments(
   return segments;
 }
 
-export function deriveSegmentsFromRoute(
-  zoneIds: number[],
-  zoneMeta: Map<number, { owner_user_id: number; transport_mode: string | null }>,
-  isPff = false,
-): DerivedSegment[] {
-  if (zoneIds.length === 0) return [];
-
-  if (!isPff) {
-    return deriveForwardSegments(zoneIds, zoneMeta, {
-      indexOffset: 0,
-      legPhase: null,
-      startNode: "sender",
-      endNode: "receiver",
-    });
-  }
-
-  const payment = deriveReversePaymentSegments(zoneIds, zoneMeta, 0);
-  const goods = deriveForwardSegments(zoneIds, zoneMeta, {
-    indexOffset: payment.length,
-    legPhase: "goods",
-    startNode: "sender",
-    endNode: "receiver",
-  });
-  return [...payment, ...goods];
-}
-
 export function expectedSegmentCountForRoute(
   zoneCount: number,
-  isPff: boolean,
+  _legacyIsPff = false,
 ): number {
   if (zoneCount === 0) return 0;
-  return isPff ? zoneCount * 2 : zoneCount;
+  return zoneCount;
 }

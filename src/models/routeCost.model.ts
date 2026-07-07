@@ -118,10 +118,13 @@ export interface RouteSegmentCostResponse {
   breakdown: SegmentCostBreakdown | null;
 }
 
+export type RoutePurpose = "payment" | "goods" | null;
+
 export interface RouteCostSummaryResponse {
   route_id: number;
   order_id: number;
   route_label: string;
+  route_purpose?: RoutePurpose;
   transporters: string[];
   segment_count: number;
   total_calculated_cost: number | null;
@@ -132,6 +135,9 @@ export interface RouteCostSummaryResponse {
   currency: string;
   status: RouteCostStatus;
   segments: RouteSegmentCostResponse[];
+  /** PFF: cannot select — the other route already uses air/sea. */
+  pff_selection_blocked?: boolean;
+  pff_selection_blocked_reason?: string | null;
 }
 
 export interface ScheduleInactiveZoneSummary {
@@ -173,11 +179,17 @@ export interface OrderRouteCostComparisonResponse {
   package_weight_lbs: number | null;
   package_dimensions_in: string | null;
   routes: RouteCostSummaryResponse[];
+  /** PFF: receiver→sender payment route options. */
+  payment_routes?: RouteCostSummaryResponse[];
+  /** PFF: sender→receiver goods route options. */
+  goods_routes?: RouteCostSummaryResponse[];
   route_locked: boolean;
   route_lock_reason: "confirmed_route" | "delivery_in_progress" | null;
   schedule_inactive_zones: ScheduleInactiveZoneSummary[];
   route_schedule_at: string | null;
   is_route_complete: boolean;
+  is_payment_route_complete?: boolean;
+  is_goods_route_complete?: boolean;
   gap: OrderDraftGapSummary | null;
 }
 

@@ -8,10 +8,12 @@ import { getOrderById, type OrderContext } from "./order.service";
 import { compareOrderRoutes } from "./routeCost.service";
 import {
   getRouteConfirmationStatus,
+  getRouteSelections,
   getSelectedRoute,
   listTransporterConfirmations,
 } from "./route_confirmation.service";
 import { getOrderStatus } from "./order_status.service";
+import { isPffPaymentMethod } from "../utils/paymentFlow";
 
 export class OrderViewError extends Error {
   status: number;
@@ -80,22 +82,27 @@ export async function getSenderOrderView(
   if (!order) throw new OrderViewError("Order not found", 404);
 
   const comparison = await compareOrderRoutes(orderId, ctx);
-  const selected = await getSelectedRoute(orderId, ctx);
+  const selections = await getRouteSelections(orderId, ctx);
+  const isPff = isPffPaymentMethod(order.payment_method);
+  const selected = isPff ? selections.goods : selections.standard;
   let confirmation: RouteConfirmationStatusResponse | null = null;
   if (selected) {
     confirmation = await getRouteConfirmationStatus(selected.selected_route_id, ctx);
   }
 
   const tracking = await getOrderStatus(orderId, ctx);
+  const allRoutes = isPff
+    ? [...(comparison.goods_routes ?? [])]
+    : comparison.routes;
   const transporters =
     confirmation?.segments.map((s) => s.transporter_name) ??
-    comparison.routes[0]?.transporters ??
+    allRoutes[0]?.transporters ??
     [];
 
   return {
     order,
     tracking_status: tracking.tracking_status,
-    all_routes: comparison.routes,
+    all_routes: allRoutes,
     selected_route: selected,
     confirmation,
     transporters: [...new Set(transporters)],
@@ -112,7 +119,9 @@ export async function getReceiverOrderView(
   const order = await getOrderById(orderId, ctx);
   if (!order) throw new OrderViewError("Order not found", 404);
 
-  const selected = await getSelectedRoute(orderId, ctx);
+  const selections = await getRouteSelections(orderId, ctx);
+  const isPff = isPffPaymentMethod(order.payment_method);
+  const selected = isPff ? selections.payment : selections.standard;
   let confirmation: RouteConfirmationStatusResponse | null = null;
   let transporter_chain: string[] = [];
   if (selected) {

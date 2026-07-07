@@ -13,6 +13,7 @@ import {
   parseScheduleFromRow,
 } from "./zoneSchedule.service";
 import { getOrderById, OrderError, type OrderContext } from "./order.service";
+import { isPffPaymentMethod } from "../utils/paymentFlow";
 
 /**
  * Milestone 2 — Order draft preview.
@@ -751,18 +752,24 @@ function enumerateChains(
       return;
     }
 
-    // If we arrived at an air/sea zone via one of its terminals, the only way
-    // out that actually *uses* the flight/voyage is via the OTHER terminal.
-    // Leaving through the same terminal means the leg between departure and
-    // arrival is never travelled, so the air/sea zone is pointless on this
-    // route — skip those exits entirely.
+    // Air/sea legs are ONE-DIRECTIONAL (departure → arrival). Land zones are
+    // bidirectional, but a flight/voyage can only be travelled from its
+    // departure terminal to its arrival terminal. So when we arrive at an
+    // air/sea zone via one of its terminals, the only valid way through is to
+    // have entered at `departure` and to leave via `arrival`. Entering at the
+    // arrival terminal (i.e. trying to use the leg backwards) is a dead end.
     const entryTerminal = entryConn ? hubTerminalOf(entryConn, current) : null;
 
     for (const { neighbour, connection } of adjacency.get(current) ?? []) {
       if (visited.has(neighbour)) continue;
       if (entryTerminal != null) {
         const exitTerminal = hubTerminalOf(connection, current);
-        if (exitTerminal != null && exitTerminal === entryTerminal) continue;
+        // Only permit the forward leg: entered at departure, leaving at arrival.
+        // This blocks same-terminal hops (leg never travelled) and reverse
+        // traversal (arrival → departure), which air/sea cannot do.
+        if (!(entryTerminal === "departure" && exitTerminal === "arrival")) {
+          continue;
+        }
       }
       const remaining = distToDest.get(neighbour);
       if (remaining == null) continue; // neighbour can't reach any destination
@@ -1444,7 +1451,8 @@ export async function previewOrderZoneConnectionsByCoordinates(
  */
 export async function previewOrderZoneConnectionsForOrder(
   orderId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
+  routePurpose: "goods" | "payment" = "goods",
 ): Promise<OrderDraftPreview> {
   const order = await getOrderById(orderId, ctx);
   if (!order) throw new OrderError("Order not found", 404);
@@ -1457,6 +1465,36 @@ export async function previewOrderZoneConnectionsForOrder(
     destination_lng == null
   ) {
     throw new OrderError("Order is missing pickup or delivery coordinates", 400);
+  }
+
+  if (
+    routePurpose === "payment" &&
+    isPffPaymentMethod(order.payment_method)
+  ) {
+    // Payment route runs receiver → sender. Pathfinding respects air/sea
+    // one-directionality (departure → arrival), so air/sea legs only appear
+    // here when a flight/voyage actually runs in the receiver → sender
+    // direction; land zones are bidirectional and available either way.
+    const paymentPreview = await previewOrderZoneConnectionsByCoordinates({
+      source_lat: destination_lat,
+      source_lng: destination_lng,
+      destination_lat: sender_lat,
+      destination_lng: sender_lng,
+      source_name: order.receiver_name,
+      source_address: order.destination_address,
+      destination_name: order.source_name || order.sender_name,
+      destination_address: order.sender_address,
+      max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
+      schedule_at: order.route_schedule_at ?? undefined,
+    });
+    if (paymentPreview.is_connected_to_destination) {
+      return {
+        ...paymentPreview,
+        message:
+          "Payment route preview (receiver → sender). Land zones work both ways; air and sea legs only appear when a route runs in this direction.",
+      };
+    }
+    return paymentPreview;
   }
 
   return previewOrderZoneConnectionsByCoordinates({

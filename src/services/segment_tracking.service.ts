@@ -75,13 +75,60 @@ async function loadSegment(segmentId: number): Promise<SegmentRow | null> {
 }
 
 async function assertRouteConfirmedForOrder(orderId: number): Promise<void> {
+  const orderResult = await pool.query(
+    `SELECT payment_method, tracking_status FROM orders WHERE id = $1`,
+    [orderId],
+  );
+  const paymentMethod = String(orderResult.rows[0]?.payment_method ?? "");
+  const tracking = String(orderResult.rows[0]?.tracking_status ?? "");
+
+  if (isPffPaymentMethod(paymentMethod)) {
+    if (tracking === "ROUTES_READY" || tracking === "PICKUP_AVAILABLE" || tracking === "PAYMENT_DELIVERED" || tracking === "PICKED_UP" || tracking === "IN_TRANSIT" || tracking === "DELIVERED") {
+      return;
+    }
+    const { payment, goods } = await loadPffSelectionStatuses(orderId);
+    if (payment === "confirmed" && goods === "confirmed") return;
+    throw new SegmentTrackingError(
+      "Both payment and goods routes must be confirmed before updating segment status",
+      400,
+    );
+  }
+
   const result = await pool.query(
-    `SELECT status FROM route_selections WHERE order_id = $1`,
-    [orderId]
+    `SELECT status FROM route_selections WHERE order_id = $1 AND route_purpose = 'standard'`,
+    [orderId],
   );
   if (result.rowCount === 0 || String(result.rows[0].status) !== "confirmed") {
     throw new SegmentTrackingError("Route must be confirmed before updating segment status", 400);
   }
+}
+
+async function loadPffSelectionStatuses(
+  orderId: number,
+): Promise<{ payment: string | null; goods: string | null }> {
+  const result = await pool.query(
+    `SELECT route_purpose, status FROM route_selections WHERE order_id = $1 AND route_purpose IN ('payment', 'goods')`,
+    [orderId],
+  );
+  let payment: string | null = null;
+  let goods: string | null = null;
+  for (const row of result.rows) {
+    const purpose = String(row.route_purpose);
+    const status = String(row.status);
+    if (purpose === "payment") payment = status;
+    if (purpose === "goods") goods = status;
+  }
+  return { payment, goods };
+}
+
+async function getPaymentRouteId(orderId: number): Promise<number | null> {
+  const result = await pool.query(
+    `SELECT selected_route_id FROM route_selections
+     WHERE order_id = $1 AND route_purpose = 'payment' AND status = 'confirmed'`,
+    [orderId],
+  );
+  if (result.rowCount === 0) return null;
+  return Number(result.rows[0].selected_route_id);
 }
 
 async function assertPickupReadyForSegment(seg: SegmentRow): Promise<void> {
@@ -142,18 +189,21 @@ async function getPreviousLegStatusInPhase(
   return isSegmentLegStatus(raw) ? raw : "not_started";
 }
 
-async function paymentLegComplete(routeId: number): Promise<boolean> {
+async function paymentLegComplete(orderId: number, routeId?: number): Promise<boolean> {
+  const paymentRouteId = routeId ?? (await getPaymentRouteId(orderId));
+  if (paymentRouteId == null) return false;
+
   const result = await pool.query(
     `SELECT sc.leg_status
      FROM route_segment_costs rsc
      JOIN segment_confirmations sc ON sc.segment_id = rsc.id
-     WHERE rsc.route_id = $1 AND rsc.leg_phase = 'payment'
+     WHERE rsc.route_id = $1
      ORDER BY rsc.segment_index`,
-    [routeId]
+    [paymentRouteId],
   );
   if (result.rowCount === 0) return true;
   const statuses: SegmentLegStatus[] = result.rows.map((row) =>
-    isSegmentLegStatus(row.leg_status) ? row.leg_status : "not_started"
+    isSegmentLegStatus(row.leg_status) ? row.leg_status : "not_started",
   );
   return phaseLegDelivered(statuses);
 }
@@ -162,18 +212,33 @@ async function loadActiveLegSegments(orderId: number): Promise<
   { segment_index: number; leg_status: SegmentLegStatus; leg_phase: string | null }[]
 > {
   const result = await pool.query(
-    `SELECT rsc.segment_index, sc.leg_status, rsc.leg_phase
+    `SELECT rsc.segment_index, sc.leg_status, rsc.leg_phase, r.route_purpose
      FROM segment_confirmations sc
      JOIN route_segment_costs rsc ON rsc.id = sc.segment_id
-     JOIN route_selections rs ON rs.selected_route_id = sc.route_id AND rs.order_id = $1
+     JOIN order_routes r ON r.id = sc.route_id
+     JOIN route_selections rs
+       ON rs.order_id = $1
+      AND rs.selected_route_id = sc.route_id
+      AND rs.status = 'confirmed'
      WHERE sc.status = 'accepted'
-     ORDER BY rsc.segment_index`,
-    [orderId]
+     ORDER BY
+       CASE COALESCE(r.route_purpose, rsc.leg_phase)
+         WHEN 'payment' THEN 0
+         WHEN 'goods' THEN 1
+         ELSE 2
+       END,
+       rsc.segment_index`,
+    [orderId],
   );
   return result.rows.map((r) => ({
     segment_index: Number(r.segment_index),
     leg_status: isSegmentLegStatus(r.leg_status) ? r.leg_status : "not_started",
-    leg_phase: r.leg_phase != null ? String(r.leg_phase) : null,
+    leg_phase:
+      r.leg_phase != null
+        ? String(r.leg_phase)
+        : r.route_purpose != null
+          ? String(r.route_purpose)
+          : null,
   }));
 }
 
@@ -334,8 +399,12 @@ async function assertProducerHandoff(
     `SELECT rsc.transporter_id, sc.leg_status
      FROM route_segment_costs rsc
      JOIN segment_confirmations sc ON sc.segment_id = rsc.id
-     WHERE rsc.route_id = $1 AND rsc.handoff_role = 'payment_delivery'`,
-    [seg.route_id]
+     JOIN route_selections rs
+       ON rs.order_id = $1
+      AND rs.route_purpose = 'payment'
+      AND rs.selected_route_id = rsc.route_id
+     WHERE rsc.handoff_role = 'payment_delivery'`,
+    [seg.order_id],
   );
   if (result.rowCount === 0) return;
 
@@ -406,7 +475,7 @@ export async function updateSegmentLegStatus(
         403
       );
     }
-    if (isPff && seg.leg_phase === "goods" && !(await paymentLegComplete(seg.route_id))) {
+    if (isPff && seg.leg_phase === "goods" && !(await paymentLegComplete(seg.order_id))) {
       throw new SegmentTrackingError(
         "Payment leg must be completed before goods pickup can begin",
         400

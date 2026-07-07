@@ -8,6 +8,7 @@ import {
 } from "../models/order.model";
 import { isTrackingStatus, type TrackingStatus } from "../models/orderTracking.model";
 import type { RouteSelectionStatus } from "../models/routeConfirmation.model";
+import { isPffPaymentMethod } from "../utils/paymentFlow";
 
 const ROUTE_SELECTION_STATUSES = [
   "pending",
@@ -21,6 +22,18 @@ function isRouteSelectionStatus(value: unknown): value is RouteSelectionStatus {
     typeof value === "string" &&
     (ROUTE_SELECTION_STATUSES as readonly string[]).includes(value)
   );
+}
+
+function aggregatePffRouteSelectionStatus(
+  paymentStatus: string | null,
+  goodsStatus: string | null,
+): RouteSelectionStatus | null {
+  if (!paymentStatus && !goodsStatus) return null;
+  const statuses = [paymentStatus, goodsStatus].filter(Boolean) as string[];
+  if (statuses.some((s) => s === "rejected")) return "rejected";
+  if (statuses.length === 2 && statuses.every((s) => s === "confirmed")) return "confirmed";
+  if (statuses.some((s) => s === "confirmed")) return "partially_confirmed";
+  return "pending";
 }
 import type { UserRole } from "../models/userRole.model";
 import { notifyOrderParticipants, notifyUsers } from "./notification.service";
@@ -43,7 +56,6 @@ import {
   normalizePaymentPackages,
   parsePaymentPackagesFromStorage,
 } from "../models/paymentPackage.model";
-import { isPffPaymentMethod } from "../utils/paymentFlow";
 import { syncOrderTrackingFromSegments } from "./segment_tracking.service";
 
 /**
@@ -116,14 +128,27 @@ const ORDER_SELECT = `
          s.full_name AS sender_name,
          s.phone     AS sender_phone_user,
          r.full_name AS receiver_name,
-         rs.status AS route_selection_status,
-         rs.selected_route_id,
-         sel_r.route_label AS selected_route_label
+         rs_std.status AS standard_route_selection_status,
+         rs_std.selected_route_id AS standard_selected_route_id,
+         std_r.route_label AS standard_selected_route_label,
+         rs_pay.status AS payment_route_selection_status,
+         rs_pay.selected_route_id AS payment_selected_route_id,
+         pay_r.route_label AS payment_selected_route_label,
+         rs_goods.status AS goods_route_selection_status,
+         rs_goods.selected_route_id AS goods_selected_route_id,
+         goods_r.route_label AS goods_selected_route_label
   FROM orders o
   JOIN users s ON s.id = o.sender_user_id
   JOIN users r ON r.id = o.receiver_user_id
-  LEFT JOIN route_selections rs ON rs.order_id = o.id
-  LEFT JOIN order_routes sel_r ON sel_r.id = rs.selected_route_id
+  LEFT JOIN route_selections rs_std
+    ON rs_std.order_id = o.id AND rs_std.route_purpose = 'standard'
+  LEFT JOIN order_routes std_r ON std_r.id = rs_std.selected_route_id
+  LEFT JOIN route_selections rs_pay
+    ON rs_pay.order_id = o.id AND rs_pay.route_purpose = 'payment'
+  LEFT JOIN order_routes pay_r ON pay_r.id = rs_pay.selected_route_id
+  LEFT JOIN route_selections rs_goods
+    ON rs_goods.order_id = o.id AND rs_goods.route_purpose = 'goods'
+  LEFT JOIN order_routes goods_r ON goods_r.id = rs_goods.selected_route_id
 `;
 
 function toNullable(value: unknown): number | null {
@@ -243,13 +268,75 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     pickup_ready_at: order.pickup_ready_at?.toISOString() ?? null,
     goods_ready_at: order.goods_ready_at?.toISOString() ?? null,
     route_schedule_at: order.route_schedule_at?.toISOString() ?? null,
-    route_selection_status: isRouteSelectionStatus(row.route_selection_status)
-      ? row.route_selection_status
+    route_selection_status: (() => {
+      const isPff = isPffPaymentMethod(order.payment_method);
+      if (isPff) {
+        return aggregatePffRouteSelectionStatus(
+          row.payment_route_selection_status != null
+            ? String(row.payment_route_selection_status)
+            : null,
+          row.goods_route_selection_status != null
+            ? String(row.goods_route_selection_status)
+            : null,
+        );
+      }
+      return isRouteSelectionStatus(row.standard_route_selection_status)
+        ? row.standard_route_selection_status
+        : null;
+    })(),
+    selected_route_id: (() => {
+      const isPff = isPffPaymentMethod(order.payment_method);
+      if (isPff) {
+        const paymentId =
+          row.payment_selected_route_id != null
+            ? Number(row.payment_selected_route_id)
+            : null;
+        const goodsId =
+          row.goods_selected_route_id != null
+            ? Number(row.goods_selected_route_id)
+            : null;
+        return paymentId ?? goodsId;
+      }
+      return row.standard_selected_route_id != null
+        ? Number(row.standard_selected_route_id)
+        : null;
+    })(),
+    selected_route_label: (() => {
+      const isPff = isPffPaymentMethod(order.payment_method);
+      if (isPff) {
+        const payLabel =
+          row.payment_selected_route_label != null
+            ? String(row.payment_selected_route_label)
+            : null;
+        const goodsLabel =
+          row.goods_selected_route_label != null
+            ? String(row.goods_selected_route_label)
+            : null;
+        if (payLabel && goodsLabel) return `${payLabel} / ${goodsLabel}`;
+        return payLabel ?? goodsLabel;
+      }
+      return row.standard_selected_route_label != null
+        ? String(row.standard_selected_route_label)
+        : null;
+    })(),
+    payment_route_selection_status: isRouteSelectionStatus(
+      row.payment_route_selection_status,
+    )
+      ? row.payment_route_selection_status
       : null,
-    selected_route_id:
-      row.selected_route_id != null ? Number(row.selected_route_id) : null,
-    selected_route_label:
-      row.selected_route_label != null ? String(row.selected_route_label) : null,
+    goods_route_selection_status: isRouteSelectionStatus(
+      row.goods_route_selection_status,
+    )
+      ? row.goods_route_selection_status
+      : null,
+    payment_selected_route_id:
+      row.payment_selected_route_id != null
+        ? Number(row.payment_selected_route_id)
+        : null,
+    goods_selected_route_id:
+      row.goods_selected_route_id != null
+        ? Number(row.goods_selected_route_id)
+        : null,
     submitted_at: order.submitted_at.toISOString(),
     delivering_at: order.delivering_at?.toISOString() ?? null,
     received_at: order.received_at?.toISOString() ?? null,

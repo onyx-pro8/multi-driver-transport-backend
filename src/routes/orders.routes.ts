@@ -32,6 +32,7 @@ import {
 } from "../services/routeCost.service";
 import {
   RouteConfirmationError,
+  getRouteSelections,
   getSelectedRoute,
 } from "../services/route_confirmation.service";
 import {
@@ -157,13 +158,28 @@ ordersRouter.get("/:id/selected-route", async (req: AuthenticatedRequest, res: R
   }
 });
 
-ordersRouter.get("/:id/zone-connection-preview", async (req: AuthenticatedRequest, res: Response) => {
+ordersRouter.get("/:id/route-selections", async (req: AuthenticatedRequest, res: Response) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id < 1) {
     return res.status(400).json({ error: "Invalid order id" });
   }
   try {
-    const preview = await previewOrderZoneConnectionsForOrder(id, ctx(req));
+    const selections = await getRouteSelections(id, ctx(req));
+    res.json(selections);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.get("/:id/zone-connection-preview", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  const purposeRaw = String(req.query.purpose ?? "goods");
+  const routePurpose = purposeRaw === "payment" ? "payment" : "goods";
+  try {
+    const preview = await previewOrderZoneConnectionsForOrder(id, ctx(req), routePurpose);
     res.json(preview);
   } catch (err) {
     handle(res, err);

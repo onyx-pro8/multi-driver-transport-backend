@@ -10,6 +10,7 @@ import type {
   SegmentCostStatus,
   TransporterQuoteRequestItem,
   AffectedRouteRef,
+  PffLegPhase,
 } from "../models/routeCost.model";
 import {
   segmentNeedsCostEntry,
@@ -24,8 +25,8 @@ import {
 import type { ZonePricingMode } from "../models/pricingRegion.model";
 import { getOrderById, updateOrderRouteSchedule, type OrderContext } from "./order.service";
 import { isPffPaymentMethod } from "../utils/paymentFlow";
+import { zoneIdsUseAirOrSea } from "../utils/pffAirSeaConstraint";
 import { totalPaymentPackageFactor } from "../models/paymentPackage.model";
-import { ensurePffRouteSegmentsForOrder } from "./pffRouteUpgrade.service";
 import { createUserNotification } from "./notification.service";
 import {
   DEFAULT_PREVIEW_MAX_DEPTH,
@@ -38,6 +39,7 @@ import {
   expectedSegmentCountForRoute,
   haversineKm,
   type DerivedSegment,
+  type RouteSegmentPurpose,
   type SegmentRate,
 } from "./costCalculation.service";
 import { resolveLandLegRoute } from "./roadRouting.service";
@@ -127,9 +129,55 @@ function routeChainsMatch(
   return liveSigs.every((sig, i) => sig === storedSigs[i]);
 }
 
+type ChainPurpose = "payment" | "goods" | "standard";
+
+function orderRoutePurposeToSegmentPurpose(
+  routePurpose: string | null | undefined,
+): RouteSegmentPurpose {
+  if (routePurpose === "payment") return "payment";
+  if (routePurpose === "goods") return "goods";
+  return "standard";
+}
+
+async function fetchPaymentRouteChains(order: OrderResponse): Promise<RouteChain[]> {
+  if (
+    order.sender_lat == null ||
+    order.sender_lng == null ||
+    order.destination_lat == null ||
+    order.destination_lng == null
+  ) {
+    return [];
+  }
+
+  // Payment route: receiver → sender. Pathfinding enforces air/sea
+  // one-directionality, so air/sea legs only appear when a flight/voyage runs
+  // in this direction; land zones are bidirectional.
+  const preview = await previewOrderZoneConnectionsByCoordinates({
+    source_lat: order.destination_lat,
+    source_lng: order.destination_lng,
+    destination_lat: order.sender_lat,
+    destination_lng: order.sender_lng,
+    source_name: order.receiver_name ?? undefined,
+    source_address: order.destination_address,
+    destination_name: order.source_name,
+    destination_address: order.sender_address,
+    max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
+    schedule_at: order.route_schedule_at ?? undefined,
+  });
+
+  return preview.possible_connection_chains.map((chain) => ({
+    zone_ids: [...chain.zone_ids],
+    connection_ids: [...chain.connection_ids],
+  }));
+}
+
 async function fetchLiveRouteChains(
   order: OrderResponse,
+  purpose: ChainPurpose = "standard",
 ): Promise<RouteChain[]> {
+  if (purpose === "payment") {
+    return fetchPaymentRouteChains(order);
+  }
   if (
     order.sender_lat == null ||
     order.sender_lng == null ||
@@ -146,22 +194,29 @@ async function fetchLiveRouteChains(
     destination_lng: order.destination_lng,
     source_name: order.source_name,
     source_address: order.sender_address,
-    destination_name: order.receiver_name,
+    destination_name: order.receiver_name ?? undefined,
     destination_address: order.destination_address,
     max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
     schedule_at: order.route_schedule_at ?? undefined,
   });
 
-  return preview.possible_connection_chains;
+  return preview.possible_connection_chains.map((chain) => ({
+    zone_ids: [...chain.zone_ids],
+    connection_ids: [...chain.connection_ids],
+  }));
 }
 
 async function orderRoutesNeedResync(
   order: OrderResponse,
   liveChains: RouteChain[],
+  routePurpose: "payment" | "goods" | null = null,
 ): Promise<boolean> {
   const stored = await pool.query(
-    `SELECT zone_ids, connection_ids FROM order_routes WHERE order_id = $1 ORDER BY route_index`,
-    [order.id],
+    `SELECT zone_ids, connection_ids FROM order_routes
+     WHERE order_id = $1
+       AND (($2::text IS NULL AND route_purpose IS NULL) OR route_purpose = $2)
+     ORDER BY route_index`,
+    [order.id, routePurpose],
   );
   if (stored.rowCount === 0) return true;
   return !routeChainsMatch(liveChains, stored.rows);
@@ -176,7 +231,7 @@ async function snapshotManualCosts(
   orderId: number,
 ): Promise<Map<string, number>> {
   const result = await pool.query(
-    `SELECT r.zone_ids, sc.segment_index, sc.manual_cost
+    `SELECT r.zone_ids, r.route_purpose, sc.segment_index, sc.manual_cost
      FROM route_segment_costs sc
      JOIN order_routes r ON r.id = sc.route_id
      WHERE r.order_id = $1 AND sc.cost_status = 'manual' AND sc.manual_cost IS NOT NULL`,
@@ -185,7 +240,8 @@ async function snapshotManualCosts(
   const map = new Map<string, number>();
   for (const row of result.rows) {
     const sig = zoneSignature(parseJsonIntArray(row.zone_ids));
-    map.set(`${sig}::${Number(row.segment_index)}`, Number(row.manual_cost));
+    const purpose = row.route_purpose != null ? String(row.route_purpose) : "standard";
+    map.set(`${purpose}::${sig}::${Number(row.segment_index)}`, Number(row.manual_cost));
   }
   return map;
 }
@@ -237,6 +293,19 @@ async function loadZoneMetaForIds(zoneIds: number[]): Promise<
     });
   }
   return map;
+}
+
+/** True when any zone on the route chain is an air or sea hub. */
+export async function orderRouteUsesAirOrSea(routeId: number): Promise<boolean> {
+  const routeResult = await pool.query(
+    `SELECT zone_ids FROM order_routes WHERE id = $1`,
+    [routeId],
+  );
+  if (routeResult.rowCount === 0) return false;
+  const zoneIds = parseJsonIntArray(routeResult.rows[0].zone_ids);
+  if (zoneIds.length === 0) return false;
+  const zoneMeta = await loadZoneMetaForIds(zoneIds);
+  return zoneIdsUseAirOrSea(zoneIds, zoneMeta);
 }
 
 async function loadZoneCentroids(
@@ -557,6 +626,7 @@ async function computeSegmentDistances(
     { zone_a_id: number; zone_b_id: number; transfer_cells: string[] }
   >,
   segments: DerivedSegment[],
+  routePurpose: RouteSegmentPurpose = "standard",
 ): Promise<
   Map<
     number,
@@ -574,7 +644,6 @@ async function computeSegmentDistances(
       const tp = conn ? transferPointFromCells(conn.transfer_cells) : null;
       if (tp) return tp;
     }
-    // Fallback: midpoint of the two zone centroids.
     const a = zoneCoords.get(zoneIds[i]);
     const b = zoneCoords.get(zoneIds[i + 1]);
     if (a && b) return { lat: (a.lat + b.lat) / 2, lng: (a.lng + b.lng) / 2 };
@@ -590,11 +659,10 @@ async function computeSegmentDistances(
       ? { lat: order.destination_lat, lng: order.destination_lng }
       : null;
 
-  const perZoneForward = new Map<
-    number,
-    { cells: number | null; km: number | null; hours: number | null }
-  >();
-  const perZoneReverse = new Map<
+  const startPoint = routePurpose === "payment" ? receiver : sender;
+  const endPoint = routePurpose === "payment" ? sender : receiver;
+
+  const perZone = new Map<
     number,
     { cells: number | null; km: number | null; hours: number | null }
   >();
@@ -604,35 +672,24 @@ async function computeSegmentDistances(
     const meta = zoneMeta.get(zoneId);
     const mode = meta?.transport_mode ?? "land";
     if (mode === "air" || mode === "sea") {
-      const lineDist = {
+      perZone.set(zoneId, {
         cells: null,
         km: zoneLineKm.get(zoneId) ?? null,
         hours: null,
-      };
-      perZoneForward.set(zoneId, lineDist);
-      perZoneReverse.set(zoneId, lineDist);
+      });
       continue;
     }
     const centroid = zoneCoords.get(zoneId) ?? null;
-    const forwardEntry = (i === 0 ? sender : transferAt(i - 1)) ?? centroid;
-    const forwardExit =
-      (i === zoneIds.length - 1 ? receiver : transferAt(i)) ?? centroid;
-    const reverseEntry = (i === zoneIds.length - 1 ? receiver : transferAt(i)) ?? centroid;
-    const reverseExit = (i === 0 ? sender : transferAt(i - 1)) ?? centroid;
+    const entry = (i === 0 ? startPoint : transferAt(i - 1)) ?? centroid;
+    const exit =
+      (i === zoneIds.length - 1 ? endPoint : transferAt(i)) ?? centroid;
 
-    const forwardDist = await resolveZoneLegDistance(
-      forwardEntry,
-      forwardExit,
+    const dist = await resolveZoneLegDistance(
+      entry,
+      exit,
       meta?.resolution ?? undefined,
     );
-    perZoneForward.set(zoneId, forwardDist);
-
-    const reverseDist = await resolveZoneLegDistance(
-      reverseEntry,
-      reverseExit,
-      meta?.resolution ?? undefined,
-    );
-    perZoneReverse.set(zoneId, reverseDist);
+    perZone.set(zoneId, dist);
   }
 
   const bySegment = new Map<
@@ -646,8 +703,6 @@ async function computeSegmentDistances(
   for (const seg of segments) {
     const line =
       seg.transport_method === "air" || seg.transport_method === "sea";
-    const perZone =
-      seg.leg_phase === "payment" ? perZoneReverse : perZoneForward;
     let cells = 0;
     let km = 0;
     let hours = 0;
@@ -731,9 +786,29 @@ async function loadTransporterNames(
   return map;
 }
 
-function nodeLabel(nodeId: string, zoneNames: Map<number, string>): string {
-  if (nodeId === "sender") return "Sender";
-  if (nodeId === "receiver") return "Receiver";
+function nodeLabel(
+  nodeId: string,
+  zoneNames: Map<number, string>,
+  options?: {
+    legPhase?: PffLegPhase | null;
+    receiverName?: string;
+    senderName?: string;
+  },
+): string {
+  const receiver = options?.receiverName?.trim() || "Receiver";
+  const sender = options?.senderName?.trim() || "Sender";
+  const leg = options?.legPhase ?? null;
+
+  if (nodeId === "sender") {
+    if (leg === "payment") return `${sender} (receives payment)`;
+    if (leg === "goods") return `${sender} (sends goods)`;
+    return "Sender";
+  }
+  if (nodeId === "receiver") {
+    if (leg === "payment") return `${receiver} (sends payment)`;
+    if (leg === "goods") return `${receiver} (receives goods)`;
+    return "Receiver";
+  }
   const zid = Number(nodeId);
   if (Number.isFinite(zid)) {
     const name = zoneNames.get(zid);
@@ -850,24 +925,49 @@ function scopeRouteSummaryForDriver(
 export async function syncOrderRoutesFromPreview(
   order: OrderResponse,
   liveChains?: RouteChain[],
+  routePurpose: "payment" | "goods" | null = null,
 ): Promise<number[]> {
   if (await isOrderRouteLocked(order.id)) {
     const existing = await pool.query(
-      `SELECT id FROM order_routes WHERE order_id = $1 ORDER BY route_index`,
-      [order.id],
+      `SELECT id FROM order_routes
+       WHERE order_id = $1
+         AND (($2::text IS NULL AND route_purpose IS NULL) OR route_purpose = $2)
+       ORDER BY route_index`,
+      [order.id, routePurpose],
     );
     return existing.rows.map((row) => Number(row.id));
   }
 
-  const chains = liveChains ?? (await fetchLiveRouteChains(order));
+  const purpose: ChainPurpose =
+    routePurpose === "payment"
+      ? "payment"
+      : routePurpose === "goods"
+        ? "goods"
+        : "standard";
+  const chains =
+    liveChains ??
+    (await fetchLiveRouteChains(
+      order,
+      isPffPaymentMethod(order.payment_method) ? purpose : "standard",
+    ));
   const routeIds: number[] = [];
+
+  const labelPrefix =
+    routePurpose === "payment"
+      ? "Payment route"
+      : routePurpose === "goods"
+        ? "Goods route"
+        : "Route";
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await client.query(`DELETE FROM order_routes WHERE order_id = $1`, [
-      order.id,
-    ]);
+    await client.query(
+      `DELETE FROM order_routes
+       WHERE order_id = $1
+         AND (($2::text IS NULL AND route_purpose IS NULL) OR route_purpose = $2)`,
+      [order.id, routePurpose],
+    );
 
     for (let i = 0; i < chains.length; i++) {
       const chain = chains[i];
@@ -879,16 +979,17 @@ export async function syncOrderRoutesFromPreview(
 
       const insert = await client.query(
         `INSERT INTO order_routes
-           (order_id, route_label, route_index, zone_ids, connection_ids, transporter_ids, is_complete)
-         VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, TRUE)
+           (order_id, route_label, route_index, zone_ids, connection_ids, transporter_ids, is_complete, route_purpose)
+         VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, TRUE, $7)
          RETURNING id`,
         [
           order.id,
-          `Route ${i + 1}`,
+          `${labelPrefix} ${i + 1}`,
           i,
           JSON.stringify(chain.zone_ids),
           JSON.stringify(chain.connection_ids),
           JSON.stringify(uniqueTransporters),
+          routePurpose,
         ],
       );
       routeIds.push(Number(insert.rows[0].id));
@@ -994,9 +1095,15 @@ export async function calculateRouteCost(
   const zoneLineDistances = await loadZoneLineDistances(zoneIds);
   const connectionIds = parseJsonIntArray(route.connection_ids);
   const connectionsById = await loadConnectionsByIds(connectionIds);
-  const isPff = isPffPaymentMethod(order.payment_method);
-  const segments = deriveSegmentsFromRoute(zoneIds, zoneMeta, isPff);
-  const pffFactor = isPff ? await getPffFactor() : 0;
+  const routePurposeRaw =
+    route.route_purpose != null ? String(route.route_purpose) : null;
+  const segmentPurpose = orderRoutePurposeToSegmentPurpose(routePurposeRaw);
+  const isPaymentRoute = segmentPurpose === "payment";
+  const segments = deriveSegmentsFromRoute(zoneIds, zoneMeta, segmentPurpose);
+  const pffFactor =
+    isPaymentRoute && isPffPaymentMethod(order.payment_method)
+      ? await getPffFactor()
+      : 0;
   const segmentDistances = await computeSegmentDistances(
     zoneIds,
     connectionIds,
@@ -1006,8 +1113,11 @@ export async function calculateRouteCost(
     zoneLineDistances,
     connectionsById,
     segments,
+    segmentPurpose,
   );
   const sig = zoneSignature(zoneIds);
+  const purposeKey =
+    routePurposeRaw != null ? routePurposeRaw : "standard";
 
   // Preserve any manual cost a user already entered so a recalculation does
   // not silently wipe it. Keyed by segment_index, which is stable for a route.
@@ -1039,7 +1149,7 @@ export async function calculateRouteCost(
   if (preservedManualByZoneSig) {
     for (const seg of segments) {
       const carried = preservedManualByZoneSig.get(
-        `${sig}::${seg.segment_index}`,
+        `${purposeKey}::${sig}::${seg.segment_index}`,
       );
       if (carried != null) {
         preservedManual.set(seg.segment_index, {
@@ -1107,8 +1217,12 @@ export async function calculateRouteCost(
       cost.cost_status = "requested";
       cost.cost_source = null;
       cost.calculation_breakdown = null;
-    } else if (seg.leg_phase === "payment" && isPff && pffFactor >= 0) {
-      const scale = pffFactor;
+    } else if (seg.leg_phase === "payment" && pffFactor >= 0) {
+      // PFF factor is a surcharge on the payment route, not a replacement:
+      // total = base × (1 + pff_factor). With the default factor of 0 the
+      // payment route keeps its full real transport cost (base); a positive
+      // factor adds the configured markup on top.
+      const scale = 1 + pffFactor;
       if (cost.calculated_cost != null) {
         cost.calculated_cost = Math.round(cost.calculated_cost * scale * 100) / 100;
       }
@@ -1183,6 +1297,7 @@ export async function calculateRouteCost(
         zoneMeta,
         await loadTransporterNames([seg.transporter_id]),
         zonePricing,
+        order,
       ),
     );
   }
@@ -1227,6 +1342,7 @@ async function buildSegmentResponse(
   zoneMeta: Map<number, { zone_name: string }>,
   transporterNames: Map<number, string>,
   zonePricing?: Map<number, ZonePricingEntry>,
+  order?: OrderResponse,
 ): Promise<RouteSegmentCostResponse> {
   const zoneNames = new Map<number, string>();
   zoneMeta.forEach((v, k) => zoneNames.set(k, v.zone_name));
@@ -1245,22 +1361,31 @@ async function buildSegmentResponse(
     nodeIdToZoneId(String(row.to_node_id));
   const pricing = zoneId != null ? (zonePricing?.get(zoneId) ?? null) : null;
   const legPhaseRaw = row.leg_phase;
-  const leg_phase =
-    legPhaseRaw === "payment" || legPhaseRaw === "goods" ? legPhaseRaw : null;
+  const leg_phase: PffLegPhase | null =
+    legPhaseRaw === "payment"
+      ? "payment"
+      : legPhaseRaw === "goods"
+        ? "goods"
+        : null;
   const handoffRaw = row.handoff_role;
   const handoff_role =
     handoffRaw === "payment_delivery" || handoffRaw === "goods_pickup"
       ? handoffRaw
       : null;
+  const labelOptions = {
+    legPhase: leg_phase,
+    receiverName: order?.receiver_name,
+    senderName: order?.sender_name,
+  };
   return {
     segment_id: Number(row.id),
     segment_index: Number(row.segment_index),
     transporter_id: tid,
     transporter_name: transporterNames.get(tid) ?? `Transporter #${tid}`,
     from_node_id: String(row.from_node_id),
-    from_label: nodeLabel(String(row.from_node_id), zoneNames),
+    from_label: nodeLabel(String(row.from_node_id), zoneNames, labelOptions),
     to_node_id: String(row.to_node_id),
-    to_label: nodeLabel(String(row.to_node_id), zoneNames),
+    to_label: nodeLabel(String(row.to_node_id), zoneNames, labelOptions),
     leg_phase,
     handoff_role,
     transport_method: String(row.transport_method),
@@ -1324,6 +1449,10 @@ async function buildRouteSummaryResponse(
     route_id: Number(route.id),
     order_id: order.id,
     route_label: String(route.route_label ?? ""),
+    route_purpose:
+      route.route_purpose === "payment" || route.route_purpose === "goods"
+        ? route.route_purpose
+        : null,
     transporters,
     segment_count: segments.length,
     total_calculated_cost:
@@ -1359,35 +1488,18 @@ export async function getRouteCostSummary(
   let segmentRows = segResult.rows;
 
   const zoneIds = parseJsonIntArray(route.zone_ids);
-  const zoneMeta = await loadZoneMetaForIds(zoneIds);
+  const expectedSegmentCount = expectedSegmentCountForRoute(zoneIds.length);
+  const segmentationStale = segmentRows.length !== expectedSegmentCount;
+  if (segmentationStale) {
+    const summary = await calculateRouteCost(routeId, ctx);
+    return ctx.role === "driver"
+      ? scopeRouteSummaryForDriver(summary, ctx.userId)
+      : summary;
+  }
 
+  const zoneMeta = await loadZoneMetaForIds(zoneIds);
   const zonePricing = await loadZonePricing(zoneIds);
 
-  // Recompute when there are no rows yet, when any segment is `missing` (rates
-  // newly configured), or when segmentation is stale. `requested` (e.g. air
-  // awaiting quote) is stable and must NOT trigger recalc on every read.
-  const isPff = isPffPaymentMethod(order.payment_method);
-  const expectedSegmentCount = expectedSegmentCountForRoute(
-    zoneIds.length,
-    isPff,
-  );
-  const segmentationStale =
-    segmentRows.length !== expectedSegmentCount ||
-    (isPff && segmentRows.some((r) => r.leg_phase == null));
-  if (isPff && segmentationStale) {
-    await ensurePffRouteSegmentsForOrder(order.id, ctx);
-    const refreshed = await pool.query(
-      `SELECT * FROM route_segment_costs WHERE route_id = $1 ORDER BY segment_index`,
-      [routeId],
-    );
-    segmentRows = refreshed.rows;
-    if (segmentRows.length !== expectedSegmentCount) {
-      const summary = await calculateRouteCost(routeId, ctx);
-      return ctx.role === "driver"
-        ? scopeRouteSummaryForDriver(summary, ctx.userId)
-        : summary;
-    }
-  }
   const needsRecalc = segmentRows.some((r) =>
     segmentNeedsRecalculation(String(r.cost_status) as SegmentCostStatus),
   );
@@ -1404,7 +1516,7 @@ export async function getRouteCostSummary(
   const segments: RouteSegmentCostResponse[] = [];
   for (const row of segmentRows) {
     segments.push(
-      await buildSegmentResponse(row, zoneMeta, names, zonePricing),
+      await buildSegmentResponse(row, zoneMeta, names, zonePricing, order),
     );
   }
 
@@ -1657,7 +1769,14 @@ export async function requestSegmentQuote(
     console.error("[notifications] quote_request failed:", err),
   );
 
-  return buildSegmentResponse(updated.rows[0], zoneMeta, names, zonePricing);
+  const order = await getOrderById(orderId, ctx);
+  return buildSegmentResponse(
+    updated.rows[0],
+    zoneMeta,
+    names,
+    zonePricing,
+    order ?? undefined,
+  );
 }
 
 async function applyQuotedSegmentCost(
@@ -1733,7 +1852,14 @@ async function applyQuotedSegmentCost(
     `SELECT * FROM route_segment_costs WHERE id = $1`,
     [segmentCostId],
   );
-  return buildSegmentResponse(updated.rows[0], zoneMeta, names, zonePricing);
+  const order = await getOrderById(orderId, ctx);
+  return buildSegmentResponse(
+    updated.rows[0],
+    zoneMeta,
+    names,
+    zonePricing,
+    order ?? undefined,
+  );
 }
 
 async function recalculateRouteSummary(routeId: number): Promise<void> {
@@ -1806,12 +1932,29 @@ async function resyncAndCostOrder(
   ctx: OrderContext,
   liveChains?: RouteChain[],
 ): Promise<void> {
+  const preservedManual = await snapshotManualCosts(order.id);
+  const isPff = isPffPaymentMethod(order.payment_method);
+
+  if (isPff) {
+    const paymentChains = await fetchLiveRouteChains(order, "payment");
+    const goodsChains = await fetchLiveRouteChains(order, "goods");
+    await syncOrderRoutesFromPreview(order, paymentChains, "payment");
+    await syncOrderRoutesFromPreview(order, goodsChains, "goods");
+    const routes = await pool.query(
+      `SELECT id FROM order_routes WHERE order_id = $1`,
+      [order.id],
+    );
+    for (const row of routes.rows) {
+      await calculateRouteCost(Number(row.id), ctx, preservedManual);
+    }
+    return;
+  }
+
   const chains = liveChains ?? (await fetchLiveRouteChains(order));
   if (chains.length === 0) {
     await syncOrderRoutesFromPreview(order, []);
     return;
   }
-  const preservedManual = await snapshotManualCosts(order.id);
   const routeIds = await syncOrderRoutesFromPreview(order, chains);
   for (const routeId of routeIds) {
     await calculateRouteCost(routeId, ctx, preservedManual);
@@ -1820,6 +1963,8 @@ async function resyncAndCostOrder(
 
 async function loadOrderRouteConnectivity(orderRow: OrderResponse): Promise<{
   isRouteComplete: boolean;
+  isPaymentRouteComplete: boolean;
+  isGoodsRouteComplete: boolean;
   scheduleInactiveZones: OrderRouteCostComparisonResponse["schedule_inactive_zones"];
   gapSummary: OrderRouteCostComparisonResponse["gap"];
 }> {
@@ -1829,10 +1974,16 @@ async function loadOrderRouteConnectivity(orderRow: OrderResponse): Promise<{
     orderRow.destination_lat == null ||
     orderRow.destination_lng == null
   ) {
-    return { isRouteComplete: true, scheduleInactiveZones: [], gapSummary: null };
+    return {
+      isRouteComplete: true,
+      isPaymentRouteComplete: true,
+      isGoodsRouteComplete: true,
+      scheduleInactiveZones: [],
+      gapSummary: null,
+    };
   }
   try {
-    const preview = await previewOrderZoneConnectionsByCoordinates({
+    const goodsPreview = await previewOrderZoneConnectionsByCoordinates({
       source_lat: orderRow.sender_lat,
       source_lng: orderRow.sender_lng,
       destination_lat: orderRow.destination_lat,
@@ -1844,20 +1995,48 @@ async function loadOrderRouteConnectivity(orderRow: OrderResponse): Promise<{
       max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
       schedule_at: orderRow.route_schedule_at ?? undefined,
     });
+    const isGoodsRouteComplete = goodsPreview.is_connected_to_destination;
+    const isPff = isPffPaymentMethod(orderRow.payment_method);
+    let isPaymentRouteComplete = isGoodsRouteComplete;
+    if (isPff) {
+      const paymentPreview = await previewOrderZoneConnectionsByCoordinates({
+        source_lat: orderRow.destination_lat,
+        source_lng: orderRow.destination_lng,
+        destination_lat: orderRow.sender_lat,
+        destination_lng: orderRow.sender_lng,
+        source_name: orderRow.receiver_name,
+        source_address: orderRow.destination_address,
+        destination_name: orderRow.source_name,
+        destination_address: orderRow.sender_address,
+        max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
+        schedule_at: orderRow.route_schedule_at ?? undefined,
+      });
+      isPaymentRouteComplete = paymentPreview.is_connected_to_destination;
+    }
     return {
-      isRouteComplete: preview.is_connected_to_destination,
-      scheduleInactiveZones: preview.schedule_inactive_zones ?? [],
-      gapSummary: preview.gap
+      isRouteComplete: isPff
+        ? isGoodsRouteComplete && isPaymentRouteComplete
+        : isGoodsRouteComplete,
+      isPaymentRouteComplete,
+      isGoodsRouteComplete,
+      scheduleInactiveZones: goodsPreview.schedule_inactive_zones ?? [],
+      gapSummary: goodsPreview.gap
         ? {
-            distance_km: preview.gap.distance_km,
-            bridge_message: preview.gap.bridge_message,
-            bridge_candidates: preview.gap.bridge_candidates ?? [],
-            message: preview.gap.message,
+            distance_km: goodsPreview.gap.distance_km,
+            bridge_message: goodsPreview.gap.bridge_message,
+            bridge_candidates: goodsPreview.gap.bridge_candidates ?? [],
+            message: goodsPreview.gap.message,
           }
         : null,
     };
   } catch {
-    return { isRouteComplete: true, scheduleInactiveZones: [], gapSummary: null };
+    return {
+      isRouteComplete: true,
+      isPaymentRouteComplete: true,
+      isGoodsRouteComplete: true,
+      scheduleInactiveZones: [],
+      gapSummary: null,
+    };
   }
 }
 
@@ -1894,7 +2073,12 @@ async function buildOrderRouteComparison(
       [orderId],
     );
     if ((routesResult.rowCount ?? 0) > 0) {
-      await syncOrderRoutesFromPreview(orderRow, []);
+      if (isPff) {
+        await syncOrderRoutesFromPreview(orderRow, [], "payment");
+        await syncOrderRoutesFromPreview(orderRow, [], "goods");
+      } else {
+        await syncOrderRoutesFromPreview(orderRow, []);
+      }
     }
 
     return {
@@ -1909,54 +2093,63 @@ async function buildOrderRouteComparison(
       package_weight_lbs: weightLbs,
       package_dimensions_in: dims,
       routes: [],
+      payment_routes: isPff ? [] : undefined,
+      goods_routes: isPff ? [] : undefined,
       route_locked: false,
       route_lock_reason: null,
       schedule_inactive_zones: connectivity.scheduleInactiveZones,
       route_schedule_at: orderRow.route_schedule_at ?? null,
       is_route_complete: false,
+      is_payment_route_complete: connectivity.isPaymentRouteComplete,
+      is_goods_route_complete: connectivity.isGoodsRouteComplete,
       gap: connectivity.gapSummary,
     };
   }
 
   const routesResult = await pool.query(
-    `SELECT * FROM order_routes WHERE order_id = $1 ORDER BY route_index`,
+    `SELECT * FROM order_routes WHERE order_id = $1 ORDER BY route_purpose NULLS FIRST, route_index`,
     [orderId],
   );
 
-  // For confirmed / in-progress deliveries, keep the persisted route snapshot
-  // even when it no longer appears in the live zone graph.
   const liveSigs =
-    !lockInfo.locked && liveChains
+    !lockInfo.locked && liveChains && !isPff
       ? new Set(liveChains.map(chainSignature))
       : null;
   const storedRows = liveSigs
     ? routesResult.rows.filter((r) => liveSigs.has(storedRouteSignature(r)))
     : routesResult.rows;
 
-  const routes: RouteCostSummaryResponse[] = [];
-  for (const route of storedRows) {
-    const summary = await getRouteCostSummary(Number(route.id), ctx);
-    if (ctx.role === "driver" && summary.segments.length === 0) continue;
-    routes.push(summary);
-  }
-
-  routes.sort((a, b) => {
-    if (a.total_final_cost == null && b.total_final_cost == null) return 0;
-    if (a.total_final_cost == null) return 1;
-    if (b.total_final_cost == null) return -1;
-    return a.total_final_cost - b.total_final_cost;
-  });
-
-  const currency = routes[0]?.currency ?? "CAD";
-
-  if (isPff) {
-    routes.sort((a, b) => {
+  const sortByCost = (list: RouteCostSummaryResponse[]) => {
+    list.sort((a, b) => {
       if (a.total_final_cost == null && b.total_final_cost == null) return 0;
       if (a.total_final_cost == null) return 1;
       if (b.total_final_cost == null) return -1;
       return a.total_final_cost - b.total_final_cost;
     });
+  };
+
+  const standardRoutes: RouteCostSummaryResponse[] = [];
+  const paymentRoutes: RouteCostSummaryResponse[] = [];
+  const goodsRoutes: RouteCostSummaryResponse[] = [];
+
+  for (const route of storedRows) {
+    const summary = await getRouteCostSummary(Number(route.id), ctx);
+    if (ctx.role === "driver" && summary.segments.length === 0) continue;
+    const purpose = route.route_purpose != null ? String(route.route_purpose) : null;
+    if (purpose === "payment") paymentRoutes.push(summary);
+    else if (purpose === "goods") goodsRoutes.push(summary);
+    else standardRoutes.push(summary);
   }
+
+  sortByCost(standardRoutes);
+  sortByCost(paymentRoutes);
+  sortByCost(goodsRoutes);
+
+  const currency =
+    standardRoutes[0]?.currency ??
+    paymentRoutes[0]?.currency ??
+    goodsRoutes[0]?.currency ??
+    "CAD";
 
   return {
     order_id: orderId,
@@ -1969,12 +2162,16 @@ async function buildOrderRouteComparison(
     package_factor: orderRow.package_factor,
     package_weight_lbs: weightLbs,
     package_dimensions_in: dims,
-    routes,
+    routes: isPff ? [] : standardRoutes,
+    payment_routes: isPff ? paymentRoutes : undefined,
+    goods_routes: isPff ? goodsRoutes : undefined,
     route_locked: lockInfo.locked,
     route_lock_reason: lockInfo.reason,
     schedule_inactive_zones: connectivity.scheduleInactiveZones,
     route_schedule_at: orderRow.route_schedule_at ?? null,
     is_route_complete: connectivity.isRouteComplete,
+    is_payment_route_complete: connectivity.isPaymentRouteComplete,
+    is_goods_route_complete: connectivity.isGoodsRouteComplete,
     gap: connectivity.gapSummary,
   };
 }
@@ -2004,6 +2201,10 @@ export async function recalculateRouteCostsForOrder(
   }
 
   const liveChains = await withOrderResyncLock(order.id, async () => {
+    if (isPffPaymentMethod(order.payment_method)) {
+      await resyncAndCostOrder(order, ctx);
+      return [];
+    }
     const chains = await fetchLiveRouteChains(order);
     if (chains.length === 0) {
       await syncOrderRoutesFromPreview(order, []);
@@ -2033,6 +2234,20 @@ export async function compareOrderRoutes(
     return buildOrderRouteComparison(orderId, ctx, undefined, order);
   }
 
+  if (isPffPaymentMethod(order.payment_method)) {
+    await withOrderResyncLock(order.id, async () => {
+      if (await isOrderRouteLocked(order.id)) return;
+      const paymentChains = await fetchLiveRouteChains(order, "payment");
+      const goodsChains = await fetchLiveRouteChains(order, "goods");
+      const paymentStale = await orderRoutesNeedResync(order, paymentChains, "payment");
+      const goodsStale = await orderRoutesNeedResync(order, goodsChains, "goods");
+      if (paymentStale || goodsStale) {
+        await resyncAndCostOrder(order, ctx);
+      }
+    });
+    return buildOrderRouteComparison(orderId, ctx, undefined, order);
+  }
+
   let liveChains = await fetchLiveRouteChains(order);
 
   if (liveChains.length === 0) {
@@ -2043,10 +2258,6 @@ export async function compareOrderRoutes(
       });
     }
     return buildOrderRouteComparison(orderId, ctx, liveChains, order);
-  }
-
-  if (isPffPaymentMethod(order.payment_method)) {
-    await ensurePffRouteSegmentsForOrder(orderId, ctx);
   }
 
   if (await orderRoutesNeedResync(order, liveChains)) {
@@ -2147,11 +2358,13 @@ export async function listTransporterQuoteRequests(
     const zoneMeta = await loadZoneMetaForIds(zoneIds);
     const zonePricing = await loadZonePricing(zoneIds);
     const names = await loadTransporterNames([Number(primary.transporter_id)]);
+    const order = await getOrderById(Number(primary.order_id), ctx);
     const segment = await buildSegmentResponse(
       primary,
       zoneMeta,
       names,
       zonePricing,
+      order ?? undefined,
     );
 
     const affectedRoutes: AffectedRouteRef[] = [];

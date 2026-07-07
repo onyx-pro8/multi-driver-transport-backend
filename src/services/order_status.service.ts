@@ -22,7 +22,9 @@ export class OrderStatusError extends Error {
 const TRANSITIONS: Record<TrackingStatus, TrackingStatus[]> = {
   AWAITING_CONNECT: [],
   REJECTED: [],
-  CONFIRMED: ["PICKUP_AVAILABLE"],
+  CONFIRMED: ["PICKUP_AVAILABLE", "ROUTES_IN_PROGRESS"],
+  ROUTES_IN_PROGRESS: [],
+  ROUTES_READY: ["PICKUP_AVAILABLE"],
   PICKUP_AVAILABLE: ["PICKED_UP"],
   PICKED_UP: ["IN_TRANSIT"],
   IN_TRANSIT: ["DELIVERED", "PAYMENT_DELIVERED"],
@@ -50,9 +52,42 @@ export async function addStatusHistory(
 }
 
 async function assertRouteConfirmed(orderId: number): Promise<void> {
+  const orderResult = await pool.query(
+    `SELECT payment_method, tracking_status FROM orders WHERE id = $1`,
+    [orderId],
+  );
+  const paymentMethod = String(orderResult.rows[0]?.payment_method ?? "");
+  const tracking = String(orderResult.rows[0]?.tracking_status ?? "");
+
+  if (isPffPaymentMethod(paymentMethod)) {
+    if (
+      tracking === "ROUTES_READY" ||
+      tracking === "PICKUP_AVAILABLE" ||
+      tracking === "PAYMENT_DELIVERED" ||
+      tracking === "PICKED_UP" ||
+      tracking === "IN_TRANSIT" ||
+      tracking === "DELIVERED"
+    ) {
+      return;
+    }
+    const result = await pool.query(
+      `SELECT route_purpose, status FROM route_selections
+       WHERE order_id = $1 AND route_purpose IN ('payment', 'goods')`,
+      [orderId],
+    );
+    const byPurpose = new Map(result.rows.map((r) => [String(r.route_purpose), String(r.status)]));
+    if (byPurpose.get("payment") === "confirmed" && byPurpose.get("goods") === "confirmed") {
+      return;
+    }
+    throw new OrderStatusError(
+      "Both payment and goods routes must be confirmed before updating tracking status",
+      400,
+    );
+  }
+
   const result = await pool.query(
-    `SELECT status FROM route_selections WHERE order_id = $1`,
-    [orderId]
+    `SELECT status FROM route_selections WHERE order_id = $1 AND route_purpose = 'standard'`,
+    [orderId],
   );
   if (result.rowCount === 0 || String(result.rows[0].status) !== "confirmed") {
     throw new OrderStatusError("Route must be confirmed before updating tracking status", 400);
@@ -73,16 +108,17 @@ async function getDriverSegmentContext(
   userId: number
 ): Promise<{ segment_index: number; segment_count: number } | null> {
   const result = await pool.query(
-    `SELECT rsc.segment_index,
+    `SELECT rsc.segment_index, rsc.route_id,
             (
               SELECT COUNT(*)::int
               FROM route_segment_costs rsc2
-              JOIN route_selections rs2
-                ON rs2.selected_route_id = rsc2.route_id AND rs2.order_id = $1
+              WHERE rsc2.route_id = rsc.route_id
             ) AS segment_count
      FROM route_segment_costs rsc
      JOIN route_selections rs
-       ON rs.selected_route_id = rsc.route_id AND rs.order_id = $1
+       ON rs.selected_route_id = rsc.route_id
+      AND rs.order_id = $1
+      AND rs.status = 'confirmed'
      WHERE rsc.transporter_id = $2
      ORDER BY rsc.segment_index
      LIMIT 1`,
@@ -242,7 +278,7 @@ export async function updateOrderStatus(
     if (pickupReadyAt) {
       return getOrderStatus(orderId, ctx);
     }
-    if (current !== "CONFIRMED" && current !== "PICKUP_AVAILABLE") {
+    if (current !== "CONFIRMED" && current !== "ROUTES_READY" && current !== "PICKUP_AVAILABLE") {
       throw new OrderStatusError("Cannot mark pickup ready from the current status", 400);
     }
     await pool.query(

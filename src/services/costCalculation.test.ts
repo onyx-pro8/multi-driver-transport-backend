@@ -101,7 +101,7 @@ describe("deriveSegmentsFromRoute", () => {
       [10, { owner_user_id: 1, transport_mode: "land" }],
       [20, { owner_user_id: 2, transport_mode: "land" }],
     ]);
-    const segments = deriveSegmentsFromRoute([10, 20], zoneMeta, false);
+    const segments = deriveSegmentsFromRoute([10, 20], zoneMeta, "standard");
     assert.equal(segments.length, 2);
     assert.equal(segments[0].from_node_id, "sender");
     assert.equal(segments[0].to_node_id, "10");
@@ -109,22 +109,32 @@ describe("deriveSegmentsFromRoute", () => {
     assert.equal(segments[0].leg_phase, null);
   });
 
-  it("builds payment then goods legs for PFF orders", () => {
+  it("builds payment route segments receiver→sender for PFF payment routes", () => {
     const zoneMeta = new Map([
       [10, { owner_user_id: 1, transport_mode: "land" }],
       [20, { owner_user_id: 2, transport_mode: "land" }],
     ]);
-    const segments = deriveSegmentsFromRoute([10, 20], zoneMeta, true);
-    assert.equal(segments.length, 4);
+    const segments = deriveSegmentsFromRoute([10, 20], zoneMeta, "payment");
+    assert.equal(segments.length, 2);
     assert.equal(segments[0].leg_phase, "payment");
     assert.equal(segments[0].from_node_id, "receiver");
-    assert.equal(segments[0].to_node_id, "20");
-    assert.equal(segments[1].from_node_id, "20");
+    assert.equal(segments[0].to_node_id, "10");
     assert.equal(segments[1].to_node_id, "sender");
-    assert.equal(segments[2].leg_phase, "goods");
-    assert.equal(segments[2].from_node_id, "sender");
-    assert.equal(segments[2].to_node_id, "10");
-    assert.equal(segments[3].to_node_id, "receiver");
+    assert.equal(segments[1].handoff_role, "payment_delivery");
+  });
+
+  it("builds goods route segments sender→receiver for PFF goods routes", () => {
+    const zoneMeta = new Map([
+      [10, { owner_user_id: 1, transport_mode: "land" }],
+      [20, { owner_user_id: 2, transport_mode: "land" }],
+    ]);
+    const segments = deriveSegmentsFromRoute([10, 20], zoneMeta, "goods");
+    assert.equal(segments.length, 2);
+    assert.equal(segments[0].leg_phase, "goods");
+    assert.equal(segments[0].from_node_id, "sender");
+    assert.equal(segments[0].to_node_id, "10");
+    assert.equal(segments[0].handoff_role, "goods_pickup");
+    assert.equal(segments[1].to_node_id, "receiver");
   });
 });
 

@@ -102,6 +102,10 @@ export interface OrderResponse {
   route_selection_status?: import("./routeConfirmation.model").RouteSelectionStatus | null;
   selected_route_id?: number | null;
   selected_route_label?: string | null;
+  payment_route_selection_status?: import("./routeConfirmation.model").RouteSelectionStatus | null;
+  goods_route_selection_status?: import("./routeConfirmation.model").RouteSelectionStatus | null;
+  payment_selected_route_id?: number | null;
+  goods_selected_route_id?: number | null;
   submitted_at: string;
   delivering_at: string | null;
   received_at: string | null;
