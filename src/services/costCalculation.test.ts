@@ -62,6 +62,11 @@ describe("resolveSegmentTimeHours", () => {
     const hours = resolveSegmentTimeHours("land", null, null, 100);
     assert.equal(hours, 2);
   });
+
+  it("falls back to sea distance estimate when no schedule", () => {
+    const hours = resolveSegmentTimeHours("sea", null, null, 370);
+    assert.equal(hours, 10);
+  });
 });
 
 describe("estimateLandTransitHours", () => {

@@ -36,6 +36,7 @@ import {
   calculateSegmentCost,
   calculateSegmentDistanceH3,
   deriveSegmentsFromRoute,
+  estimateSeaTransitHours,
   expectedSegmentCountForRoute,
   haversineKm,
   type DerivedSegment,
@@ -43,6 +44,7 @@ import {
   type SegmentRate,
 } from "./costCalculation.service";
 import { resolveLandLegRoute } from "./roadRouting.service";
+import { computeSeaRouteDistanceKm } from "./seaRoute.service";
 import {
   ExternalQuoteError,
   fetchExternalQuote,
@@ -315,11 +317,9 @@ async function loadZoneCentroids(
 > {
   if (zoneIds.length === 0) return new Map();
   const result = await pool.query(
-    `SELECT z.id, z.transport_mode,
-            COALESCE(
-              (SELECT elem FROM jsonb_array_elements_text(z.h3_cells) WITH ORDINALITY AS t(elem, ord) WHERE ord = 1 LIMIT 1),
-              NULL
-            ) AS sample_cell
+    `SELECT z.id, z.transport_mode, z.h3_cells, z.boundary,
+            z.departure_hub_lat, z.departure_hub_lng,
+            z.arrival_hub_lat, z.arrival_hub_lng
      FROM driver_zones z
      WHERE z.id = ANY($1::int[])`,
     [zoneIds],
@@ -329,21 +329,110 @@ async function loadZoneCentroids(
     { lat: number; lng: number; transport_method: string | null }
   >();
   for (const row of result.rows) {
-    const cell = row.sample_cell != null ? String(row.sample_cell) : null;
-    if (!cell) continue;
-    try {
-      const [lat, lng] = cellToLatLng(cell);
-      map.set(Number(row.id), {
-        lat,
-        lng,
-        transport_method:
-          row.transport_mode == null ? null : String(row.transport_mode),
-      });
-    } catch {
-      /* skip */
-    }
+    const mode = row.transport_mode == null ? null : String(row.transport_mode);
+    const centroid = centroidFromZoneRow(row, mode);
+    if (!centroid) continue;
+    map.set(Number(row.id), {
+      lat: centroid.lat,
+      lng: centroid.lng,
+      transport_method: mode,
+    });
   }
   return map;
+}
+
+function parseZoneBoundary(raw: unknown): LatLng[] | null {
+  if (!raw) return null;
+  if (Array.isArray(raw)) {
+    const pts = raw
+      .map((p) => {
+        if (p && typeof p === "object" && "lat" in p && "lng" in p) {
+          const lat = Number((p as LatLng).lat);
+          const lng = Number((p as LatLng).lng);
+          if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
+        }
+        return null;
+      })
+      .filter((p): p is LatLng => p != null);
+    return pts.length >= 3 ? pts : null;
+  }
+  if (typeof raw === "string") {
+    try {
+      return parseZoneBoundary(JSON.parse(raw));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function averageLatLng(points: LatLng[]): LatLng {
+  let lat = 0;
+  let lng = 0;
+  for (const p of points) {
+    lat += p.lat;
+    lng += p.lng;
+  }
+  return { lat: lat / points.length, lng: lng / points.length };
+}
+
+function centroidFromZoneRow(
+  row: Record<string, unknown>,
+  mode: string | null,
+): LatLng | null {
+  const depLat = row.departure_hub_lat;
+  const depLng = row.departure_hub_lng;
+  if (
+    (mode === "air" || mode === "sea") &&
+    depLat != null &&
+    depLng != null &&
+    Number.isFinite(Number(depLat)) &&
+    Number.isFinite(Number(depLng))
+  ) {
+    return { lat: Number(depLat), lng: Number(depLng) };
+  }
+
+  const boundary = parseZoneBoundary(row.boundary);
+  if (boundary) return averageLatLng(boundary);
+
+  let cells: string[] = [];
+  const rawCells = row.h3_cells;
+  if (Array.isArray(rawCells)) cells = rawCells.map(String);
+  else if (typeof rawCells === "string") {
+    try {
+      const parsed = JSON.parse(rawCells);
+      if (Array.isArray(parsed)) cells = parsed.map(String);
+    } catch {
+      cells = [];
+    }
+  }
+
+  if (cells.length > 0) {
+    const sample = cells.length > 64 ? cells.filter((_, i) => i % Math.ceil(cells.length / 64) === 0) : cells;
+    const points: LatLng[] = [];
+    for (const cell of sample) {
+      try {
+        const [lat, lng] = cellToLatLng(cell);
+        points.push({ lat, lng });
+      } catch {
+        /* skip */
+      }
+    }
+    if (points.length > 0) return averageLatLng(points);
+  }
+
+  const arrLat = row.arrival_hub_lat;
+  const arrLng = row.arrival_hub_lng;
+  if (
+    arrLat != null &&
+    arrLng != null &&
+    Number.isFinite(Number(arrLat)) &&
+    Number.isFinite(Number(arrLng))
+  ) {
+    return { lat: Number(arrLat), lng: Number(arrLng) };
+  }
+
+  return null;
 }
 
 /**
@@ -607,9 +696,99 @@ async function loadConnectionsByIds(
 }
 
 /**
+ * Road / maritime / air distance for a single derived segment's from→to endpoints.
+ * Used when per-zone internal legs cannot be resolved (e.g. zone-to-zone hops).
+ */
+async function computeDirectSegmentLeg(
+  seg: DerivedSegment,
+  order: OrderResponse,
+  zoneCoords: Map<number, { lat: number; lng: number }>,
+  zoneMeta: Map<
+    number,
+    { transport_mode: string | null; resolution: number | null }
+  >,
+  zoneLineKm: Map<number, number>,
+): Promise<{
+  cells: number | null;
+  km: number | null;
+  hours: number | null;
+}> {
+  const from = nodeCoords(String(seg.from_node_id), order, zoneCoords);
+  const to = nodeCoords(String(seg.to_node_id), order, zoneCoords);
+  if (
+    from.lat == null ||
+    from.lng == null ||
+    to.lat == null ||
+    to.lng == null
+  ) {
+    return { cells: null, km: null, hours: null };
+  }
+
+  const pricedZoneId = seg.to_zone_id ?? seg.from_zone_id;
+  const resolution =
+    pricedZoneId != null
+      ? (zoneMeta.get(pricedZoneId)?.resolution ?? undefined)
+      : undefined;
+  const method = seg.transport_method;
+
+  if (method === "land") {
+    const route = await resolveLandLegRoute(
+      from.lat,
+      from.lng,
+      to.lat,
+      to.lng,
+      resolution,
+    );
+    let cells: number | null = null;
+    if (route.source === "h3") {
+      const d = calculateSegmentDistanceH3(
+        from.lat,
+        from.lng,
+        to.lat,
+        to.lng,
+        resolution,
+      );
+      cells = d.distance_h3_cells;
+    }
+    return {
+      cells,
+      km: route.distance_km,
+      hours: route.duration_hours,
+    };
+  }
+
+  if (method === "sea") {
+    const hubKm =
+      pricedZoneId != null ? (zoneLineKm.get(pricedZoneId) ?? null) : null;
+    const km =
+      hubKm ??
+      computeSeaRouteDistanceKm(
+        { lat: from.lat, lng: from.lng },
+        { lat: to.lat, lng: to.lng },
+      ) ??
+      haversineKm(from.lat, from.lng, to.lat, to.lng);
+    return {
+      cells: null,
+      km,
+      hours: estimateSeaTransitHours(km),
+    };
+  }
+
+  if (method === "air") {
+    const hubKm =
+      pricedZoneId != null ? (zoneLineKm.get(pricedZoneId) ?? null) : null;
+    const km = hubKm ?? haversineKm(from.lat, from.lng, to.lat, to.lng);
+    return { cells: null, km, hours: null };
+  }
+
+  return { cells: null, km: null, hours: null };
+}
+
+/**
  * Compute distance for each segment:
  *  - Land zones: Google Directions road km when configured, else H3; sums per zone leg.
  *  - Air/sea zones: great-circle hub distance.
+ *  - Fallback: direct from→to leg distance when per-zone data is missing.
  */
 async function computeSegmentDistances(
   zoneIds: number[],
@@ -725,6 +904,29 @@ async function computeSegmentDistances(
         haveHours = true;
       }
     }
+
+    if (!haveKm || !haveHours) {
+      const direct = await computeDirectSegmentLeg(
+        seg,
+        order,
+        zoneCoords,
+        zoneMeta,
+        zoneLineKm,
+      );
+      if (!haveKm && direct.km != null) {
+        km = direct.km;
+        haveKm = true;
+      }
+      if (!haveCells && direct.cells != null) {
+        cells = direct.cells;
+        haveCells = true;
+      }
+      if (!haveHours && direct.hours != null) {
+        hours = direct.hours;
+        haveHours = true;
+      }
+    }
+
     bySegment.set(seg.segment_index, {
       distance_h3_cells: line ? null : haveCells ? cells : null,
       distance_km: haveKm ? Math.round(km * 100) / 100 : null,
@@ -1160,20 +1362,27 @@ export async function calculateRouteCost(
     }
   }
 
-  await pool.query(`DELETE FROM route_segment_costs WHERE route_id = $1`, [
-    routeId,
-  ]);
+  const existingSegResult = await pool.query(
+    `SELECT id, segment_index FROM route_segment_costs WHERE route_id = $1`,
+    [routeId],
+  );
+  const existingIdByIndex = new Map<number, number>();
+  for (const row of existingSegResult.rows) {
+    existingIdByIndex.set(Number(row.segment_index), Number(row.id));
+  }
 
   const segmentRows: RouteSegmentCostResponse[] = [];
   let totalCalculated = 0;
   let totalManual = 0;
   let calculatedCount = 0;
   let manualCount = 0;
+  const retainedSegmentIndices: number[] = [];
 
   const bookingFeeRate = await getBookingFeeRate();
   const landSpeedKmh = await getLandSpeedKmh();
 
   for (const seg of segments) {
+    retainedSegmentIndices.push(seg.segment_index);
     const zoneId = seg.from_zone_id;
     const zoneInfo = zoneId != null ? zoneMeta.get(zoneId) : null;
     const pricingEntry =
@@ -1248,58 +1457,89 @@ export async function calculateRouteCost(
       manualCount++;
     }
 
-    const insert = await pool.query(
-      `INSERT INTO route_segment_costs
-         (route_id, segment_index, transporter_id, from_node_id, to_node_id,
-          transport_method, leg_phase, handoff_role, package_weight, package_volume,
-          distance_h3_cells, distance_km, time_hours, package_factor,
-          base_fee, weight_cost, volume_cost, distance_cost, waiting_cost, booking_fee,
-          time_factor_amount, calculated_cost, manual_cost, final_cost, cost_status, cost_source, currency, calculation_breakdown)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28::jsonb)
-       RETURNING id`,
-      [
-        routeId,
-        seg.segment_index,
-        seg.transporter_id,
-        seg.from_node_id,
-        seg.to_node_id,
-        seg.transport_method,
-        seg.leg_phase ?? null,
-        seg.handoff_role ?? null,
-        null,
-        null,
-        cost.distance_h3_cells,
-        cost.distance_km,
-        cost.time_hours,
-        cost.package_factor,
-        cost.base_fee,
-        null,
-        null,
-        cost.distance_cost,
-        cost.waiting_cost,
-        cost.booking_fee,
-        null,
-        cost.calculated_cost,
-        cost.manual_cost,
-        cost.final_cost,
-        cost.cost_status,
-        cost.cost_source,
-        cost.currency,
-        cost.calculation_breakdown
-          ? JSON.stringify(cost.calculation_breakdown)
-          : null,
-      ],
+    const segmentParams = [
+      seg.transporter_id,
+      seg.from_node_id,
+      seg.to_node_id,
+      seg.transport_method,
+      seg.leg_phase ?? null,
+      seg.handoff_role ?? null,
+      null,
+      null,
+      cost.distance_h3_cells,
+      cost.distance_km,
+      cost.time_hours,
+      cost.package_factor,
+      cost.base_fee,
+      null,
+      null,
+      cost.distance_cost,
+      cost.waiting_cost,
+      cost.booking_fee,
+      null,
+      cost.calculated_cost,
+      cost.manual_cost,
+      cost.final_cost,
+      cost.cost_status,
+      cost.cost_source,
+      cost.currency,
+      cost.calculation_breakdown
+        ? JSON.stringify(cost.calculation_breakdown)
+        : null,
+    ];
+
+    const existingSegmentId = existingIdByIndex.get(seg.segment_index);
+    const saved = await pool.query(
+      existingSegmentId != null
+        ? `UPDATE route_segment_costs SET
+             transporter_id = $1, from_node_id = $2, to_node_id = $3,
+             transport_method = $4, leg_phase = $5, handoff_role = $6,
+             package_weight = $7, package_volume = $8,
+             distance_h3_cells = $9, distance_km = $10, time_hours = $11, package_factor = $12,
+             base_fee = $13, weight_cost = $14, volume_cost = $15, distance_cost = $16,
+             waiting_cost = $17, booking_fee = $18, time_factor_amount = $19,
+             calculated_cost = $20, manual_cost = $21, final_cost = $22,
+             cost_status = $23, cost_source = $24, currency = $25, calculation_breakdown = $26::jsonb
+           WHERE id = $27
+           RETURNING *`
+        : `INSERT INTO route_segment_costs
+             (route_id, segment_index, transporter_id, from_node_id, to_node_id,
+              transport_method, leg_phase, handoff_role, package_weight, package_volume,
+              distance_h3_cells, distance_km, time_hours, package_factor,
+              base_fee, weight_cost, volume_cost, distance_cost, waiting_cost, booking_fee,
+              time_factor_amount, calculated_cost, manual_cost, final_cost, cost_status, cost_source, currency, calculation_breakdown)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28::jsonb)
+           RETURNING *`,
+      existingSegmentId != null
+        ? [...segmentParams, existingSegmentId]
+        : [
+            routeId,
+            seg.segment_index,
+            ...segmentParams,
+          ],
     );
 
     segmentRows.push(
       await buildSegmentResponse(
-        insert.rows[0],
+        saved.rows[0],
         zoneMeta,
         await loadTransporterNames([seg.transporter_id]),
         zonePricing,
         order,
       ),
     );
+  }
+
+  if (retainedSegmentIndices.length > 0) {
+    await pool.query(
+      `DELETE FROM route_segment_costs
+       WHERE route_id = $1 AND NOT (segment_index = ANY($2::int[]))`,
+      [routeId, retainedSegmentIndices],
+    );
+  } else {
+    await pool.query(`DELETE FROM route_segment_costs WHERE route_id = $1`, [
+      routeId,
+    ]);
   }
 
   const summaryInput = segmentRows.map((s) => ({

@@ -2,7 +2,10 @@ import { pool } from "../database";
 import { isTrackingStatus, type TrackingStatus } from "../models/orderTracking.model";
 import { isPffPaymentMethod } from "../utils/paymentFlow";
 
-export type OrderRouteLockReason = "confirmed_route" | "delivery_in_progress";
+export type OrderRouteLockReason =
+  | "confirmed_route"
+  | "confirmation_pending"
+  | "delivery_in_progress";
 
 export interface OrderRouteLockInfo {
   locked: boolean;
@@ -16,6 +19,21 @@ const IN_PROGRESS_TRACKING: TrackingStatus[] = [
   "IN_TRANSIT",
   "DELIVERED",
 ];
+
+/** True while transporters still have open or accepted segment confirmations. */
+async function getActiveConfirmationLock(
+  orderId: number,
+): Promise<{ locked: boolean; routeId: number | null }> {
+  const result = await pool.query(
+    `SELECT DISTINCT r.id AS route_id
+     FROM segment_confirmations sc
+     JOIN order_routes r ON r.id = sc.route_id
+     WHERE r.order_id = $1 AND sc.status IN ('pending', 'accepted')`,
+    [orderId],
+  );
+  if (result.rowCount === 0) return { locked: false, routeId: null };
+  return { locked: true, routeId: Number(result.rows[0].route_id) };
+}
 
 /**
  * Orders with a confirmed route or active delivery keep their persisted routes
@@ -40,6 +58,7 @@ export async function getOrderRouteLockInfo(orderId: number): Promise<OrderRoute
     : "CONFIRMED";
   const pickupReady = row.pickup_ready_at != null;
   const isPff = isPffPaymentMethod(String(row.payment_method ?? ""));
+  const confirmationLock = await getActiveConfirmationLock(orderId);
 
   if (isPff) {
     const selections = await pool.query(
@@ -62,6 +81,14 @@ export async function getOrderRouteLockInfo(orderId: number): Promise<OrderRoute
         locked: true,
         selectedRouteId: payment ? Number(payment.selected_route_id) : null,
         reason: "confirmed_route",
+      };
+    }
+
+    if (confirmationLock.locked) {
+      return {
+        locked: true,
+        selectedRouteId: confirmationLock.routeId,
+        reason: "confirmation_pending",
       };
     }
 
@@ -93,6 +120,14 @@ export async function getOrderRouteLockInfo(orderId: number): Promise<OrderRoute
 
   if (selectionStatus === "confirmed") {
     return { locked: true, selectedRouteId, reason: "confirmed_route" };
+  }
+
+  if (confirmationLock.locked) {
+    return {
+      locked: true,
+      selectedRouteId: selectedRouteId ?? confirmationLock.routeId,
+      reason: "confirmation_pending",
+    };
   }
 
   if (IN_PROGRESS_TRACKING.includes(tracking) && (pickupReady || tracking !== "PICKUP_AVAILABLE")) {

@@ -6,7 +6,11 @@ import type {
 } from "../models/routeCost.model";
 import type { OrderResponse } from "../models/order.model";
 import { packageFactorForType, totalPackageFactorForEntries, type PackageType, type OrderPackageEntry } from "../models/package.model";
-import { DEFAULT_BOOKING_FEE_RATE, DEFAULT_LAND_SPEED_KMH } from "../models/pricing.model";
+import {
+  DEFAULT_BOOKING_FEE_RATE,
+  DEFAULT_LAND_SPEED_KMH,
+  DEFAULT_SEA_SPEED_KMH,
+} from "../models/pricing.model";
 import type { ZonePricingMode } from "../models/pricingRegion.model";
 import { ORDER_H3_RESOLUTION } from "./order.service";
 
@@ -221,8 +225,16 @@ export function estimateLandTransitHours(
   return roundMoney(distanceKm / landSpeedKmh);
 }
 
+export function estimateSeaTransitHours(
+  distanceKm: number | null,
+  seaSpeedKmh = DEFAULT_SEA_SPEED_KMH
+): number | null {
+  if (distanceKm == null || distanceKm <= 0 || seaSpeedKmh <= 0) return null;
+  return roundMoney(distanceKm / seaSpeedKmh);
+}
+
 /**
- * Waiting/transit hours: zone schedule first; for land, estimate from distance when absent.
+ * Waiting/transit hours: zone schedule first; for land/sea, estimate from distance when absent.
  */
 export function resolveSegmentTimeHours(
   transportMethod: string,
@@ -230,7 +242,8 @@ export function resolveSegmentTimeHours(
   arrivalTime: string | null | undefined,
   distanceKm: number | null,
   landSpeedKmh = DEFAULT_LAND_SPEED_KMH,
-  roadDurationHours?: number | null
+  roadDurationHours?: number | null,
+  seaSpeedKmh = DEFAULT_SEA_SPEED_KMH
 ): number | null {
   const scheduled = scheduleDurationHours(departureTime, arrivalTime);
   if (scheduled != null) return scheduled;
@@ -239,6 +252,9 @@ export function resolveSegmentTimeHours(
   }
   if (transportMethod === "land") {
     return estimateLandTransitHours(distanceKm, landSpeedKmh);
+  }
+  if (transportMethod === "sea") {
+    return estimateSeaTransitHours(distanceKm, seaSpeedKmh);
   }
   return null;
 }
@@ -275,7 +291,7 @@ function resolveDistanceKm(
   distanceOverride: SegmentCostInput["distanceOverride"]
 ): { distanceKm: number | null; distanceCells: number | null } {
   let distanceKm = distanceOverride?.distance_km ?? null;
-  const distanceCells = distanceOverride?.distance_h3_cells ?? null;
+  let distanceCells = distanceOverride?.distance_h3_cells ?? null;
 
   if (distanceKm == null) {
     const line = isLineMode(segment.transport_method);
@@ -287,6 +303,9 @@ function resolveDistanceKm(
       const to = resolveCoords(segment.to_node_id, order, zoneCoords);
       const dist = calculateSegmentDistanceH3(from.lat, from.lng, to.lat, to.lng);
       distanceKm = dist.distance_km;
+      if (distanceCells == null) {
+        distanceCells = dist.distance_h3_cells;
+      }
     }
   }
 
@@ -346,6 +365,20 @@ function emptyResult(
   };
 }
 
+function attachDistanceAndTime(
+  result: SegmentCostResult,
+  distanceKm: number | null,
+  distanceCells: number | null,
+  timeHours: number | null
+): SegmentCostResult {
+  return {
+    ...result,
+    distance_km: distanceKm,
+    distance_h3_cells: distanceCells,
+    time_hours: timeHours,
+  };
+}
+
 export function calculateSegmentCost(input: SegmentCostInput): SegmentCostResult {
   const { segment, order, rate, zoneCoords } = input;
   const currency = rate?.currency ?? "CAD";
@@ -356,21 +389,6 @@ export function calculateSegmentCost(input: SegmentCostInput): SegmentCostResult
   );
   const bookingFeeRate = input.bookingFeeRate ?? DEFAULT_BOOKING_FEE_RATE;
   const method = segment.transport_method;
-
-  if (transportRequiresCostRequest(method)) {
-    return emptyResult("requested", currency, packageFactor);
-  }
-
-  if (input.pricingMode === "manual") {
-    return emptyResult("requested", currency, packageFactor);
-  }
-
-  if (!rateIsConfigured(rate)) {
-    return emptyResult(method === "sea" ? "requested" : "missing", currency, packageFactor);
-  }
-
-  const baseCost = calculateBaseCost(rate);
-  const adjustedBase = roundMoney(baseCost * packageFactor);
 
   const { distanceKm, distanceCells } = resolveDistanceKm(
     segment,
@@ -388,6 +406,36 @@ export function calculateSegmentCost(input: SegmentCostInput): SegmentCostResult
     input.landSpeedKmh ?? DEFAULT_LAND_SPEED_KMH,
     input.distanceOverride?.duration_hours
   );
+
+  if (transportRequiresCostRequest(method)) {
+    return attachDistanceAndTime(
+      emptyResult("requested", currency, packageFactor),
+      distanceKm,
+      distanceCells,
+      timeHours
+    );
+  }
+
+  if (input.pricingMode === "manual") {
+    return attachDistanceAndTime(
+      emptyResult("requested", currency, packageFactor),
+      distanceKm,
+      distanceCells,
+      timeHours
+    );
+  }
+
+  if (!rateIsConfigured(rate)) {
+    return attachDistanceAndTime(
+      emptyResult(method === "sea" ? "requested" : "missing", currency, packageFactor),
+      distanceKm,
+      distanceCells,
+      timeHours
+    );
+  }
+
+  const baseCost = calculateBaseCost(rate);
+  const adjustedBase = roundMoney(baseCost * packageFactor);
   const travellingCost = roundMoney(calculateTravelCost(distanceKm, rate?.cost_per_km ?? null));
   const waitingCost = roundMoney(calculateWaitingCost(timeHours, rate?.cost_per_hour ?? null));
 

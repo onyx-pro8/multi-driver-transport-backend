@@ -146,3 +146,50 @@ function pathHasLandCrossings(path: LatLng[]): boolean {
   }
   return false;
 }
+
+function roundKm(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/** Great-circle distance along a polyline (sum of segment haversines). */
+export function polylineDistanceKm(points: LatLng[]): number | null {
+  if (points.length < 2) return null;
+  let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    const R = 6371;
+    const toRad = (d: number) => (d * Math.PI) / 180;
+    const dLat = toRad(b.lat - a.lat);
+    const dLng = toRad(b.lng - a.lng);
+    const lat1 = toRad(a.lat);
+    const lat2 = toRad(b.lat);
+    const h =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+    total += R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+  }
+  return roundKm(total);
+}
+
+/** Maritime route length in km; falls back to great-circle when routing fails. */
+export function computeSeaRouteDistanceKm(
+  departure: LatLng,
+  arrival: LatLng
+): number | null {
+  const path = computeSeaRoute(departure, arrival);
+  if (path && path.length >= 2) {
+    const km = polylineDistanceKm(path.map(([lat, lng]) => ({ lat, lng })));
+    if (km != null && km > 0) return km;
+  }
+  const R = 6371;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(arrival.lat - departure.lat);
+  const dLng = toRad(arrival.lng - departure.lng);
+  const lat1 = toRad(departure.lat);
+  const lat2 = toRad(arrival.lat);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return roundKm(R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h)));
+}

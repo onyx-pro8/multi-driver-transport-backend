@@ -119,6 +119,10 @@ export interface TransporterConfirmationItem {
   leg_status: SegmentLegStatus;
   rejection_reason: string | null;
   route_label: string;
+  route_purpose: RoutePurpose | null;
+  zone_ids: number[];
+  connection_ids: number[];
+  transport_method: string | null;
   sender_address: string;
   destination_address: string;
   sent_at: string;
@@ -127,9 +131,11 @@ export interface TransporterConfirmationItem {
   pickup_ready_at: string | null;
   goods_ready_at: string | null;
   payment_method: string;
+  payment_packages: import("./paymentPackage.model").PaymentPackageEntry[];
   route_segment_count: number;
   previous_leg_status: SegmentLegStatus | null;
   final_cost: number | null;
+  distance_km: number | null;
   currency: string;
   cost_status: SegmentCostStatus;
   package_type: string | null;

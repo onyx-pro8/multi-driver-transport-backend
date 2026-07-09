@@ -35,6 +35,25 @@ import {
   isZoneScheduleActive,
   parseScheduleFromRow,
 } from "./zoneSchedule.service";
+import { parsePaymentPackagesFromStorage } from "../models/paymentPackage.model";
+
+function parseJsonIntArray(raw: unknown): number[] {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) {
+    return raw.map((v) => Number(v)).filter((n) => Number.isFinite(n));
+  }
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed)
+        ? parsed.map((v) => Number(v)).filter((n) => Number.isFinite(n))
+        : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
 
 export class RouteConfirmationError extends Error {
   status: number;
@@ -766,6 +785,9 @@ export async function listTransporterConfirmations(
             sc.rejection_reason,
             r.order_id,
             r.route_label,
+            r.route_purpose,
+            r.zone_ids,
+            r.connection_ids,
             rsc.segment_index,
             rsc.leg_phase,
             rsc.handoff_role,
@@ -777,6 +799,7 @@ export async function listTransporterConfirmations(
             o.pickup_ready_at,
             o.goods_ready_at,
             o.payment_method,
+            o.payment_packages,
             o.weight_lbs,
             o.package_length,
             o.package_width,
@@ -822,7 +845,10 @@ export async function listTransporterConfirmations(
     [transporterId]
   );
 
-  const summaryCache = new Map<number, Awaited<ReturnType<typeof getRouteCostSummary>>>();
+  const summaryCache = new Map<
+    number,
+    Awaited<ReturnType<typeof getRouteCostSummary>> | null
+  >();
   const scheduleInactiveCache = new Map<number, ScheduleInactiveZoneSummary[]>();
   const zoneScheduleCache = new Map<number, { active: boolean | null; summary: string | null; inactive_reason: string | null }>();
 
@@ -834,12 +860,15 @@ export async function listTransporterConfirmations(
       try {
         summaryCache.set(routeId, await getRouteCostSummary(routeId, ctx));
       } catch (err) {
-        if (err instanceof RouteCostError) continue;
-        throw err;
+        if (err instanceof RouteCostError) {
+          summaryCache.set(routeId, null);
+        } else {
+          throw err;
+        }
       }
     }
-    const summary = summaryCache.get(routeId)!;
-    const seg = summary.segments.find((s) => s.segment_id === Number(row.segment_id));
+    const summary = summaryCache.get(routeId);
+    const seg = summary?.segments.find((s) => s.segment_id === Number(row.segment_id));
     const zoneId = seg?.zone_id ?? null;
 
     if (!scheduleInactiveCache.has(orderId)) {
@@ -877,6 +906,13 @@ export async function listTransporterConfirmations(
       leg_status: isSegmentLegStatus(row.leg_status) ? row.leg_status : "not_started",
       rejection_reason: row.rejection_reason != null ? String(row.rejection_reason) : null,
       route_label: String(row.route_label),
+      route_purpose:
+        row.route_purpose === "payment" || row.route_purpose === "goods"
+          ? row.route_purpose
+          : null,
+      zone_ids: parseJsonIntArray(row.zone_ids),
+      connection_ids: parseJsonIntArray(row.connection_ids),
+      transport_method: seg?.transport_method ?? null,
       sender_address: String(row.sender_address),
       destination_address: String(row.destination_address),
       sent_at: row.sent_at ? new Date(row.sent_at).toISOString() : new Date().toISOString(),
@@ -894,6 +930,7 @@ export async function listTransporterConfirmations(
         ? new Date(String(row.goods_ready_at)).toISOString()
         : null,
       payment_method: String(row.payment_method ?? ""),
+      payment_packages: parsePaymentPackagesFromStorage(row.payment_packages),
       route_segment_count: Number(row.route_segment_count ?? 0),
       previous_leg_status: isSegmentLegStatus(row.previous_leg_status)
         ? row.previous_leg_status
@@ -901,6 +938,7 @@ export async function listTransporterConfirmations(
           ? null
           : "not_started",
       final_cost: seg?.final_cost ?? null,
+      distance_km: seg?.distance_km ?? null,
       currency: seg?.currency ?? "CAD",
       cost_status: seg?.cost_status ?? "missing",
       package_type: row.package_type != null ? String(row.package_type) : null,

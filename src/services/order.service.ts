@@ -149,6 +149,83 @@ const ORDER_SELECT = `
   LEFT JOIN route_selections rs_goods
     ON rs_goods.order_id = o.id AND rs_goods.route_purpose = 'goods'
   LEFT JOIN order_routes goods_r ON goods_r.id = rs_goods.selected_route_id
+  LEFT JOIN LATERAL (
+    SELECT
+      ROUND(COALESCE(SUM(sc.distance_km), 0)::numeric, 2) AS selected_route_total_distance_km,
+      ROUND(
+        COALESCE(
+          SUM(CASE WHEN sc.transport_method = 'land' THEN sc.distance_km ELSE 0 END),
+          0
+        )::numeric,
+        2
+      ) AS selected_land_distance_km,
+      ROUND(
+        COALESCE(
+          SUM(CASE WHEN sc.transport_method = 'sea' THEN sc.distance_km ELSE 0 END),
+          0
+        )::numeric,
+        2
+      ) AS selected_sea_distance_km,
+      ROUND(
+        COALESCE(
+          SUM(CASE WHEN sc.transport_method = 'air' THEN sc.distance_km ELSE 0 END),
+          0
+        )::numeric,
+        2
+      ) AS selected_air_distance_km,
+      COALESCE(
+        json_agg(
+          json_build_object(
+            'route_id',
+            sc.route_id,
+            'route_purpose',
+            r.route_purpose,
+            'segment_index',
+            sc.segment_index,
+            'transport_method',
+            sc.transport_method,
+            'from_label',
+            CASE
+              WHEN sc.from_node_id = 'sender' THEN 'Sender'
+              WHEN sc.from_node_id = 'receiver' THEN 'Receiver'
+              ELSE COALESCE(zf.zone_name, CONCAT('Zone ', sc.from_node_id))
+            END,
+            'to_label',
+            CASE
+              WHEN sc.to_node_id = 'sender' THEN 'Sender'
+              WHEN sc.to_node_id = 'receiver' THEN 'Receiver'
+              ELSE COALESCE(zt.zone_name, CONCAT('Zone ', sc.to_node_id))
+            END,
+            'distance_km',
+            CASE
+              WHEN sc.distance_km IS NULL THEN NULL
+              ELSE ROUND(sc.distance_km::numeric, 2)
+            END
+          )
+          ORDER BY
+            CASE r.route_purpose
+              WHEN 'payment' THEN 0
+              WHEN 'goods' THEN 1
+              ELSE 2
+            END,
+            sc.segment_index
+        ),
+        '[]'::json
+      ) AS selected_route_segments
+    FROM route_segment_costs sc
+    JOIN order_routes r ON r.id = sc.route_id
+    LEFT JOIN driver_zones zf
+      ON sc.from_node_id ~ '^\d+$'
+     AND zf.id = sc.from_node_id::int
+    LEFT JOIN driver_zones zt
+      ON sc.to_node_id ~ '^\d+$'
+     AND zt.id = sc.to_node_id::int
+    WHERE sc.route_id IN (
+      rs_std.selected_route_id,
+      rs_pay.selected_route_id,
+      rs_goods.selected_route_id
+    )
+  ) selected_route_distance ON TRUE
 `;
 
 function toNullable(value: unknown): number | null {
@@ -319,6 +396,44 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
         ? String(row.standard_selected_route_label)
         : null;
     })(),
+    selected_route_total_distance_km:
+      row.selected_route_total_distance_km != null
+        ? Number(row.selected_route_total_distance_km)
+        : null,
+    selected_route_method_distance_km: {
+      land:
+        row.selected_land_distance_km != null
+          ? Number(row.selected_land_distance_km)
+          : 0,
+      sea:
+        row.selected_sea_distance_km != null
+          ? Number(row.selected_sea_distance_km)
+          : 0,
+      air:
+        row.selected_air_distance_km != null
+          ? Number(row.selected_air_distance_km)
+          : 0,
+    },
+    selected_route_segments: Array.isArray(row.selected_route_segments)
+      ? row.selected_route_segments.map((seg) => ({
+          route_id: Number((seg as Record<string, unknown>).route_id),
+          route_purpose: (() => {
+            const purpose = (seg as Record<string, unknown>).route_purpose;
+            if (purpose === "standard" || purpose === "payment" || purpose === "goods") {
+              return purpose;
+            }
+            return null;
+          })(),
+          segment_index: Number((seg as Record<string, unknown>).segment_index),
+          transport_method: String((seg as Record<string, unknown>).transport_method ?? ""),
+          from_label: String((seg as Record<string, unknown>).from_label ?? ""),
+          to_label: String((seg as Record<string, unknown>).to_label ?? ""),
+          distance_km:
+            (seg as Record<string, unknown>).distance_km != null
+              ? Number((seg as Record<string, unknown>).distance_km)
+              : null,
+        }))
+      : [],
     payment_route_selection_status: isRouteSelectionStatus(
       row.payment_route_selection_status,
     )

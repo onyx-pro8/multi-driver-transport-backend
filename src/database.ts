@@ -1,4 +1,4 @@
-import { Pool, PoolConfig } from "pg";
+import { Pool, PoolClient, PoolConfig } from "pg";
 import dotenv from "dotenv";
 import { CURRENCIES } from "./models/currency.model";
 
@@ -78,6 +78,33 @@ pool.on("error", (err) => {
   console.error("[pg] idle client error (dropping client):", err.message);
 });
 
+/** Prevent concurrent ensureSchema runs from racing on DROP/ADD CONSTRAINT. */
+const SCHEMA_BOOTSTRAP_LOCK_KEY = 0x4d444833;
+
+function isPgDuplicateObjectError(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    (err as { code?: string }).code === "42710"
+  );
+}
+
+/** Drop and recreate a named CHECK constraint; tolerate duplicate_object races. */
+async function refreshCheckConstraint(
+  client: PoolClient,
+  table: string,
+  constraintName: string,
+  checkExpression: string,
+): Promise<void> {
+  await client.query(`ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${constraintName};`);
+  await client.query(
+    `ALTER TABLE ${table} ADD CONSTRAINT ${constraintName} CHECK (${checkExpression});`,
+  ).catch((err: unknown) => {
+    if (!isPgDuplicateObjectError(err)) throw err;
+  });
+}
+
 /**
  * Idempotent schema bootstrap.
  *
@@ -89,6 +116,8 @@ pool.on("error", (err) => {
 export async function ensureSchema(): Promise<void> {
   const client = await pool.connect();
   try {
+    await client.query("SELECT pg_advisory_lock($1)", [SCHEMA_BOOTSTRAP_LOCK_KEY]);
+
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id              SERIAL PRIMARY KEY,
@@ -121,12 +150,12 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trustworthiness INTEGER NOT NULL DEFAULT 0;`);
 
     // Refresh the role check constraint to cover the new roles.
-    await client.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;`);
-    await client.query(`
-      ALTER TABLE users
-        ADD CONSTRAINT users_role_check
-        CHECK (role IN ('admin', 'driver', 'sender', 'receiver', 'user'));
-    `);
+    await refreshCheckConstraint(
+      client,
+      "users",
+      "users_role_check",
+      "role IN ('admin', 'driver', 'sender', 'receiver', 'user')",
+    );
 
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_email_lower
@@ -721,8 +750,8 @@ export async function ensureSchema(): Promise<void> {
     await client.query(
       `ALTER TABLE orders ADD CONSTRAINT orders_tracking_status_check
          CHECK (tracking_status IN (
-           'AWAITING_CONNECT', 'REJECTED', 'CONFIRMED', 'PICKUP_AVAILABLE',
-           'PICKED_UP', 'IN_TRANSIT', 'PAYMENT_DELIVERED', 'DELIVERED'
+           'AWAITING_CONNECT', 'REJECTED', 'CONFIRMED', 'ROUTES_IN_PROGRESS', 'ROUTES_READY',
+           'PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'PAYMENT_DELIVERED', 'DELIVERED'
          ));`
     );
     await client.query(
@@ -733,7 +762,7 @@ export async function ensureSchema(): Promise<void> {
       `UPDATE orders
        SET tracking_status = 'CONFIRMED'
        WHERE pickup_ready_at IS NULL
-         AND tracking_status NOT IN ('CONFIRMED', 'DELIVERED')`
+         AND tracking_status IN ('PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'PAYMENT_DELIVERED')`
     );
     await client.query(
       `UPDATE orders
@@ -859,6 +888,7 @@ export async function ensureSchema(): Promise<void> {
 
     console.log("[db] schema ready");
   } finally {
+    await client.query("SELECT pg_advisory_unlock($1)", [SCHEMA_BOOTSTRAP_LOCK_KEY]).catch(() => undefined);
     client.release();
   }
 }

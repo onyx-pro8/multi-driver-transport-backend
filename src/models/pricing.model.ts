@@ -11,3 +11,6 @@ export const DEFAULT_BOOKING_FEE_RATE = 0.02;
 
 /** Fallback land speed (km/h) when estimating transit time without a schedule. */
 export const DEFAULT_LAND_SPEED_KMH = 50;
+
+/** Fallback sea speed (km/h) when estimating maritime transit time (~20 kn). */
+export const DEFAULT_SEA_SPEED_KMH = 37;

@@ -184,7 +184,7 @@ export interface OrderRouteCostComparisonResponse {
   /** PFF: sender→receiver goods route options. */
   goods_routes?: RouteCostSummaryResponse[];
   route_locked: boolean;
-  route_lock_reason: "confirmed_route" | "delivery_in_progress" | null;
+  route_lock_reason: "confirmed_route" | "confirmation_pending" | "delivery_in_progress" | null;
   schedule_inactive_zones: ScheduleInactiveZoneSummary[];
   route_schedule_at: string | null;
   is_route_complete: boolean;

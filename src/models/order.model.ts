@@ -102,6 +102,21 @@ export interface OrderResponse {
   route_selection_status?: import("./routeConfirmation.model").RouteSelectionStatus | null;
   selected_route_id?: number | null;
   selected_route_label?: string | null;
+  selected_route_total_distance_km?: number | null;
+  selected_route_method_distance_km?: {
+    land: number;
+    sea: number;
+    air: number;
+  } | null;
+  selected_route_segments?: {
+    route_id: number;
+    route_purpose: "standard" | "payment" | "goods" | null;
+    segment_index: number;
+    transport_method: string;
+    from_label: string;
+    to_label: string;
+    distance_km: number | null;
+  }[];
   payment_route_selection_status?: import("./routeConfirmation.model").RouteSelectionStatus | null;
   goods_route_selection_status?: import("./routeConfirmation.model").RouteSelectionStatus | null;
   payment_selected_route_id?: number | null;
