@@ -140,3 +140,25 @@ export async function getOrderRouteLockInfo(orderId: number): Promise<OrderRoute
 export async function isOrderRouteLocked(orderId: number): Promise<boolean> {
   return (await getOrderRouteLockInfo(orderId)).locked;
 }
+
+/** True when inquiry rejection or a transporter segment rejection ended route selection. */
+export async function isOrderRouteSelectionBlocked(orderId: number): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT o.tracking_status,
+            EXISTS (
+              SELECT 1 FROM route_selections rs
+              WHERE rs.order_id = o.id AND rs.status = 'rejected'
+            ) AS has_rejected_selection
+     FROM orders o
+     WHERE o.id = $1`,
+    [orderId],
+  );
+  if (result.rowCount === 0) return false;
+
+  const row = result.rows[0];
+  const tracking: TrackingStatus = isTrackingStatus(row.tracking_status)
+    ? row.tracking_status
+    : "CONFIRMED";
+  if (tracking === "REJECTED") return true;
+  return Boolean(row.has_rejected_selection);
+}

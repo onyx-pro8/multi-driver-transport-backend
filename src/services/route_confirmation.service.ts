@@ -16,7 +16,7 @@ import { createUserNotification, notifyOrderParticipants } from "./notification.
 import { getOrderById, type OrderContext } from "./order.service";
 import { isPffPaymentMethod } from "../utils/paymentFlow";
 import { syncOrderTrackingFromSegments } from "./segment_tracking.service";
-import { isOrderRouteLocked } from "./orderRouteLock.service";
+import { isOrderRouteLocked, isOrderRouteSelectionBlocked } from "./orderRouteLock.service";
 import {
   RouteCostError,
   calculateRouteCost,
@@ -187,6 +187,13 @@ export async function selectRoute(
   ctx: OrderContext,
 ): Promise<RouteSelectionResponse> {
   const { senderId, receiverId } = await assertSenderReceiverAccess(orderId, ctx);
+
+  if (await isOrderRouteSelectionBlocked(orderId)) {
+    throw new RouteConfirmationError(
+      "Cannot select a route after this shipment or route was rejected",
+      400,
+    );
+  }
 
   if (await isOrderRouteLocked(orderId)) {
     throw new RouteConfirmationError(
