@@ -24,11 +24,39 @@ const IN_PROGRESS_TRACKING: TrackingStatus[] = [
 async function getActiveConfirmationLock(
   orderId: number,
 ): Promise<{ locked: boolean; routeId: number | null }> {
+  const orderResult = await pool.query(
+    `SELECT payment_method FROM orders WHERE id = $1`,
+    [orderId],
+  );
+  if ((orderResult.rowCount ?? 0) > 0) {
+    const isPff = isPffPaymentMethod(String(orderResult.rows[0].payment_method ?? ""));
+    if (isPff) {
+      const selections = await pool.query(
+        `SELECT route_purpose, selected_route_id FROM route_selections
+         WHERE order_id = $1 AND route_purpose IN ('payment', 'goods')`,
+        [orderId],
+      );
+      const byPurpose = new Map(
+        selections.rows.map((r) => [String(r.route_purpose), r]),
+      );
+      const payment = byPurpose.get("payment");
+      const goods = byPurpose.get("goods");
+      const bothSelected =
+        payment?.selected_route_id != null && goods?.selected_route_id != null;
+      if (!bothSelected) {
+        return { locked: false, routeId: null };
+      }
+    }
+  }
+
   const result = await pool.query(
     `SELECT DISTINCT r.id AS route_id
      FROM segment_confirmations sc
      JOIN order_routes r ON r.id = sc.route_id
-     WHERE r.order_id = $1 AND sc.status IN ('pending', 'accepted')`,
+     JOIN route_selections rs ON rs.selected_route_id = r.id AND rs.order_id = r.order_id
+     WHERE r.order_id = $1
+       AND sc.status IN ('pending', 'accepted')
+       AND rs.status <> 'rejected'`,
     [orderId],
   );
   if (result.rowCount === 0) return { locked: false, routeId: null };
@@ -84,7 +112,10 @@ export async function getOrderRouteLockInfo(orderId: number): Promise<OrderRoute
       };
     }
 
-    if (confirmationLock.locked) {
+    const bothSelected =
+      payment?.selected_route_id != null && goods?.selected_route_id != null;
+
+    if (confirmationLock.locked && bothSelected) {
       return {
         locked: true,
         selectedRouteId: confirmationLock.routeId,
@@ -122,6 +153,10 @@ export async function getOrderRouteLockInfo(orderId: number): Promise<OrderRoute
     return { locked: true, selectedRouteId, reason: "confirmed_route" };
   }
 
+  if (selectionStatus === "rejected") {
+    return { locked: false, selectedRouteId: null, reason: null };
+  }
+
   if (confirmationLock.locked) {
     return {
       locked: true,
@@ -139,26 +174,4 @@ export async function getOrderRouteLockInfo(orderId: number): Promise<OrderRoute
 
 export async function isOrderRouteLocked(orderId: number): Promise<boolean> {
   return (await getOrderRouteLockInfo(orderId)).locked;
-}
-
-/** True when inquiry rejection or a transporter segment rejection ended route selection. */
-export async function isOrderRouteSelectionBlocked(orderId: number): Promise<boolean> {
-  const result = await pool.query(
-    `SELECT o.tracking_status,
-            EXISTS (
-              SELECT 1 FROM route_selections rs
-              WHERE rs.order_id = o.id AND rs.status = 'rejected'
-            ) AS has_rejected_selection
-     FROM orders o
-     WHERE o.id = $1`,
-    [orderId],
-  );
-  if (result.rowCount === 0) return false;
-
-  const row = result.rows[0];
-  const tracking: TrackingStatus = isTrackingStatus(row.tracking_status)
-    ? row.tracking_status
-    : "CONFIRMED";
-  if (tracking === "REJECTED") return true;
-  return Boolean(row.has_rejected_selection);
 }

@@ -16,7 +16,7 @@ import { createUserNotification, notifyOrderParticipants } from "./notification.
 import { getOrderById, type OrderContext } from "./order.service";
 import { isPffPaymentMethod } from "../utils/paymentFlow";
 import { syncOrderTrackingFromSegments } from "./segment_tracking.service";
-import { isOrderRouteLocked, isOrderRouteSelectionBlocked } from "./orderRouteLock.service";
+import { isOrderRouteLocked } from "./orderRouteLock.service";
 import {
   RouteCostError,
   calculateRouteCost,
@@ -180,6 +180,34 @@ async function tryFinalizePffOrder(orderId: number): Promise<void> {
   }
 }
 
+export async function clearPffTransporterConfirmationsIfIncomplete(
+  orderId: number,
+): Promise<void> {
+  const { payment, goods } = await getPffSelectionsFromDb(orderId);
+  if (payment?.selected_route_id && goods?.selected_route_id) return;
+
+  await pool.query(
+    `DELETE FROM route_confirmation_requests
+     WHERE route_id IN (SELECT id FROM order_routes WHERE order_id = $1)`,
+    [orderId],
+  );
+  await pool.query(
+    `DELETE FROM segment_confirmations
+     WHERE route_id IN (SELECT id FROM order_routes WHERE order_id = $1)`,
+    [orderId],
+  );
+}
+
+async function maybeSendPffConfirmationsToTransporters(
+  orderId: number,
+  ctx: OrderContext,
+): Promise<void> {
+  const { payment, goods } = await getPffSelectionsFromDb(orderId);
+  if (!payment?.selected_route_id || !goods?.selected_route_id) return;
+  await sendConfirmationToTransporters(Number(payment.selected_route_id), ctx);
+  await sendConfirmationToTransporters(Number(goods.selected_route_id), ctx);
+}
+
 export async function selectRoute(
   orderId: number,
   routeId: number,
@@ -187,13 +215,6 @@ export async function selectRoute(
   ctx: OrderContext,
 ): Promise<RouteSelectionResponse> {
   const { senderId, receiverId } = await assertSenderReceiverAccess(orderId, ctx);
-
-  if (await isOrderRouteSelectionBlocked(orderId)) {
-    throw new RouteConfirmationError(
-      "Cannot select a route after this shipment or route was rejected",
-      400,
-    );
-  }
 
   if (await isOrderRouteLocked(orderId)) {
     throw new RouteConfirmationError(
@@ -207,6 +228,9 @@ export async function selectRoute(
 
   const order = await getOrderById(orderId, ctx);
   if (!order) throw new RouteConfirmationError("Order not found", 404);
+  if (order.tracking_status === "REJECTED") {
+    throw new RouteConfirmationError("This shipment request was rejected", 400);
+  }
 
   const isPff = isPffPaymentMethod(order.payment_method);
   const routePurposeRaw =
@@ -223,8 +247,8 @@ export async function selectRoute(
       );
     }
     assertRoutePurposeAccess(selectionPurpose, ctx, senderId, receiverId);
-  } else if (ctx.role !== "admin" && ctx.userId !== senderId && ctx.userId !== receiverId) {
-    throw new RouteConfirmationError("Forbidden", 403);
+  } else if (ctx.role !== "admin" && ctx.userId !== receiverId) {
+    throw new RouteConfirmationError("Only the receiver can select the route", 403);
   }
 
   await calculateRouteCost(routeId, ctx);
@@ -254,7 +278,12 @@ export async function selectRoute(
     client.release();
   }
 
-  await sendConfirmationToTransporters(routeId, ctx);
+  if (isPff) {
+    await clearPffTransporterConfirmationsIfIncomplete(orderId);
+    await maybeSendPffConfirmationsToTransporters(orderId, ctx);
+  } else {
+    await sendConfirmationToTransporters(routeId, ctx);
+  }
 
   if (isPff) {
     await tryFinalizePffOrder(orderId);
@@ -278,7 +307,7 @@ export async function sendConfirmationToTransporters(
   ctx: OrderContext
 ): Promise<void> {
   const routeResult = await pool.query(
-    `SELECT r.*, o.sender_user_id, o.receiver_user_id
+    `SELECT r.*, o.sender_user_id, o.receiver_user_id, o.payment_method
      FROM order_routes r
      JOIN orders o ON o.id = r.order_id
      WHERE r.id = $1`,
@@ -287,6 +316,16 @@ export async function sendConfirmationToTransporters(
   if (routeResult.rowCount === 0) throw new RouteConfirmationError("Route not found", 404);
   const route = routeResult.rows[0];
   const orderId = Number(route.order_id);
+
+  if (isPffPaymentMethod(String(route.payment_method ?? ""))) {
+    const { payment, goods } = await getPffSelectionsFromDb(orderId);
+    if (!payment?.selected_route_id || !goods?.selected_route_id) {
+      throw new RouteConfirmationError(
+        "Both payment and delivery routes must be selected before notifying transporters",
+        400,
+      );
+    }
+  }
 
   if (ctx.role !== "admin" && ctx.userId !== Number(route.sender_user_id) && ctx.userId !== Number(route.receiver_user_id)) {
     throw new RouteConfirmationError("Forbidden", 403);
@@ -451,6 +490,20 @@ export async function rejectSegment(
     [segmentId]
   );
 
+  // Close out sibling pending confirmations so the order can pick another route.
+  await pool.query(
+    `UPDATE segment_confirmations
+     SET status = 'rejected', rejection_reason = 'Route rejected by another transporter', confirmed_at = NOW()
+     WHERE route_id = $1 AND segment_id <> $2 AND status = 'pending'`,
+    [routeId, segmentId],
+  );
+  await pool.query(
+    `UPDATE route_confirmation_requests
+     SET status = 'rejected', responded_at = NOW()
+     WHERE route_id = $1 AND segment_id <> $2 AND status = 'sent'`,
+    [routeId, segmentId],
+  );
+
   await pool.query(
     `UPDATE route_selections rs
      SET status = 'rejected', payment_status = 'not_required', updated_at = NOW()
@@ -490,6 +543,7 @@ export async function getRouteConfirmationStatus(
   const confBySegment = new Map(
     confResult.rows.map((r) => [Number(r.segment_id), r])
   );
+  const transporters_notified = (confResult.rowCount ?? 0) > 0;
 
   const segments: SegmentConfirmationDetail[] = summary.segments.map((seg) => {
     const conf = confBySegment.get(seg.segment_id);
@@ -514,9 +568,15 @@ export async function getRouteConfirmationStatus(
     };
   });
 
-  const confirmed_count = segments.filter((s) => s.status === "accepted").length;
-  const pending_count = segments.filter((s) => s.status === "pending").length;
-  const rejected_count = segments.filter((s) => s.status === "rejected").length;
+  const confirmed_count = transporters_notified
+    ? segments.filter((s) => s.status === "accepted").length
+    : 0;
+  const pending_count = transporters_notified
+    ? segments.filter((s) => s.status === "pending").length
+    : 0;
+  const rejected_count = transporters_notified
+    ? segments.filter((s) => s.status === "rejected").length
+    : 0;
   const total_segments = segments.length;
 
   const selResult = await pool.query(
@@ -524,7 +584,11 @@ export async function getRouteConfirmationStatus(
     [routeId],
   );
   const selection_status = (
-    selResult.rowCount ? String(selResult.rows[0].status) : computeSelectionStatus(segments)
+    transporters_notified
+      ? selResult.rowCount
+        ? String(selResult.rows[0].status)
+        : computeSelectionStatus(segments)
+      : "partially_confirmed"
   ) as RouteSelectionStatus;
   const payment_status = selResult.rowCount
     ? (String(selResult.rows[0].payment_status) as "pending" | "ready" | "not_required")
@@ -541,7 +605,10 @@ export async function getRouteConfirmationStatus(
     rejected_count,
     total_segments,
     progress_percent:
-      total_segments > 0 ? Math.round((confirmed_count / total_segments) * 100) : 0,
+      transporters_notified && total_segments > 0
+        ? Math.round((confirmed_count / total_segments) * 100)
+        : 0,
+    transporters_notified,
     segments,
   };
 }

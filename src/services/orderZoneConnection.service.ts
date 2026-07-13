@@ -14,7 +14,6 @@ import {
 } from "./zoneSchedule.service";
 import { getOrderById, OrderError, type OrderContext } from "./order.service";
 import { isPffPaymentMethod } from "../utils/paymentFlow";
-import { isOrderRouteSelectionBlocked } from "./orderRouteLock.service";
 
 /**
  * Milestone 2 — Order draft preview.
@@ -1457,9 +1456,8 @@ export async function previewOrderZoneConnectionsForOrder(
 ): Promise<OrderDraftPreview> {
   const order = await getOrderById(orderId, ctx);
   if (!order) throw new OrderError("Order not found", 404);
-
-  if (await isOrderRouteSelectionBlocked(orderId)) {
-    throw new OrderError("Route preview is not available after rejection", 400);
+  if (order.tracking_status === "REJECTED") {
+    throw new OrderError("This shipment request was rejected", 400);
   }
 
   const { sender_lat, sender_lng, destination_lat, destination_lng } = order;

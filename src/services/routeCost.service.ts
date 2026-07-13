@@ -54,7 +54,6 @@ import {
 import {
   getOrderRouteLockInfo,
   isOrderRouteLocked,
-  isOrderRouteSelectionBlocked,
 } from "./orderRouteLock.service";
 
 export class RouteCostError extends Error {
@@ -2429,8 +2428,8 @@ export async function recalculateRouteCostsForOrder(
       400,
     );
   }
-  if (await isOrderRouteSelectionBlocked(orderId)) {
-    throw new RouteCostError("Route costs are not available after rejection", 400);
+  if (order.tracking_status === "REJECTED") {
+    throw new RouteCostError("This shipment request was rejected", 400);
   }
   if (scheduleAt !== undefined) {
     order = await updateOrderRouteSchedule(orderId, scheduleAt, ctx);
@@ -2468,8 +2467,8 @@ export async function compareOrderRoutes(
       400,
     );
   }
-  if (await isOrderRouteSelectionBlocked(orderId)) {
-    throw new RouteCostError("Route costs are not available after rejection", 400);
+  if (order.tracking_status === "REJECTED") {
+    throw new RouteCostError("This shipment request was rejected", 400);
   }
 
   const lockInfo = await getOrderRouteLockInfo(order.id);
