@@ -478,19 +478,28 @@ function pricedZoneIdForSegment(row: {
   return null;
 }
 
+/** Normalizes PFF leg phase for quote dedup — payment and goods must not share a quote. */
+function quoteLegPhaseKey(legPhase: unknown): string {
+  const phase = legPhase != null ? String(legPhase) : null;
+  if (phase === "payment" || phase === "goods") return phase;
+  return "standard";
+}
+
 function quoteDedupKey(
   orderId: number,
   transporterId: number,
   pricedZoneId: number,
+  legPhase: unknown,
 ): string {
-  return `${orderId}:${transporterId}:${pricedZoneId}`;
+  return `${orderId}:${transporterId}:${pricedZoneId}:${quoteLegPhaseKey(legPhase)}`;
 }
 
-/** All pending segment-cost rows on an order for the same transporter + priced zone. */
+/** Pending segment-cost rows on an order for the same transporter, priced zone, and leg phase. */
 async function findSiblingSegmentRows(
   orderId: number,
   transporterId: number,
   pricedZoneId: number,
+  legPhase: unknown,
   statuses: SegmentCostStatus[] = ["requested", "missing"],
 ): Promise<
   Array<
@@ -510,9 +519,10 @@ async function findSiblingSegmentRows(
        AND sc.cost_status = ANY($3::text[])`,
     [orderId, transporterId, statuses],
   );
+  const legPhaseKey = quoteLegPhaseKey(legPhase);
   return result.rows.filter((row) => {
     const zid = pricedZoneIdForSegment(row);
-    return zid === pricedZoneId;
+    return zid === pricedZoneId && quoteLegPhaseKey(row.leg_phase) === legPhaseKey;
   }) as Array<
     Record<string, unknown> & {
       route_id: number;
@@ -1956,6 +1966,7 @@ export async function requestSegmentQuote(
     orderId,
     transporterId,
     pricedZoneId,
+    seg.leg_phase,
     ["requested", "missing", "calculated", "manual"],
   );
   if (siblings.some((s) => String(s.cost_status) === "manual")) {
@@ -2063,6 +2074,7 @@ async function applyQuotedSegmentCost(
     orderId,
     transporterId,
     pricedZoneId,
+    seg.leg_phase,
     ["requested", "missing", "calculated", "manual"],
   );
   const siblingIds = siblings.map((s) => Number(s.id));
@@ -2577,6 +2589,7 @@ export async function listTransporterQuoteRequests(
       Number(row.order_id),
       Number(row.transporter_id),
       pricedZoneId,
+      row.leg_phase,
     );
     const existing = groups.get(key);
     if (existing) {
