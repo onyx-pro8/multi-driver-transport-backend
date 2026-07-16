@@ -127,6 +127,8 @@ export interface RouteCostSummaryResponse {
   route_purpose?: RoutePurpose;
   transporters: string[];
   segment_count: number;
+  /** Zone chain for this route — used to highlight the matching path on the map. */
+  zone_ids?: number[];
   total_calculated_cost: number | null;
   total_manual_cost: number | null;
   total_final_cost: number | null;

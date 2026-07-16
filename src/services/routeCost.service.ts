@@ -1705,6 +1705,7 @@ async function buildRouteSummaryResponse(
         : null,
     transporters,
     segment_count: segments.length,
+    zone_ids: parseJsonIntArray(route.zone_ids),
     total_calculated_cost:
       summary?.total_calculated_cost != null
         ? Number(summary.total_calculated_cost)
