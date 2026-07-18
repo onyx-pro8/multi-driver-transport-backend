@@ -1048,6 +1048,19 @@ function nodeCoords(
   return { lat: null, lng: null };
 }
 
+/**
+ * Older builds collapsed nearby points into one coarse H3 cell, storing 0 km
+ * for real legs (e.g. airport → delivery address). Flag those rows so the
+ * summary recalculates them with the fixed distance logic.
+ */
+function segmentHasStaleZeroDistance(row: Record<string, unknown>): boolean {
+  if (String(row.cost_status) !== "calculated") return false;
+  if (row.distance_km == null) return false;
+  const km = Number(row.distance_km);
+  if (!Number.isFinite(km) || km > 0) return false;
+  return String(row.from_node_id) !== String(row.to_node_id);
+}
+
 function summarizeRouteStatus(
   segments: { cost_status: SegmentCostStatus; final_cost: number | null }[],
 ): {
@@ -1563,14 +1576,21 @@ export async function calculateRouteCost(
     total_final_cost,
   } = summarizeRouteStatus(summaryInput);
 
-  await pool.query(`DELETE FROM route_cost_summaries WHERE route_id = $1`, [
-    routeId,
-  ]);
   await pool.query(
     `INSERT INTO route_cost_summaries
        (route_id, order_id, total_calculated_cost, total_manual_cost, total_final_cost,
         missing_segment_count, requested_segment_count, currency, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (route_id) DO UPDATE SET
+       order_id = EXCLUDED.order_id,
+       total_calculated_cost = EXCLUDED.total_calculated_cost,
+       total_manual_cost = EXCLUDED.total_manual_cost,
+       total_final_cost = EXCLUDED.total_final_cost,
+       missing_segment_count = EXCLUDED.missing_segment_count,
+       requested_segment_count = EXCLUDED.requested_segment_count,
+       currency = EXCLUDED.currency,
+       status = EXCLUDED.status,
+       updated_at = NOW()`,
     [
       routeId,
       order.id,
@@ -1751,8 +1771,10 @@ export async function getRouteCostSummary(
   const zoneMeta = await loadZoneMetaForIds(zoneIds);
   const zonePricing = await loadZonePricing(zoneIds);
 
-  const needsRecalc = segmentRows.some((r) =>
-    segmentNeedsRecalculation(String(r.cost_status) as SegmentCostStatus),
+  const needsRecalc = segmentRows.some(
+    (r) =>
+      segmentNeedsRecalculation(String(r.cost_status) as SegmentCostStatus) ||
+      segmentHasStaleZeroDistance(r),
   );
   if (segmentRows.length === 0 || needsRecalc) {
     const summary = await calculateRouteCost(routeId, ctx);

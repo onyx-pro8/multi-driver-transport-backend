@@ -5,6 +5,7 @@ import { convertRequestSchema, ConvertResponse } from "../schemas/h3.schema";
 import { polygonToCellsSchema } from "../schemas/h3Polygon.schema";
 import { cellCenter, H3Resolution, pointToCell } from "../services/h3_service";
 import { hierarchicalPolygonCells } from "../services/hierarchicalFill";
+import { computeLandRoute } from "../services/roadRouting.service";
 import { computeSeaRoute } from "../services/seaRoute.service";
 
 const seaRouteQuerySchema = z.object({
@@ -13,6 +14,8 @@ const seaRouteQuerySchema = z.object({
   to_lat: z.coerce.number().min(-90).max(90),
   to_lng: z.coerce.number().min(-180).max(180),
 });
+
+const landRouteQuerySchema = seaRouteQuerySchema;
 
 export const h3Router = Router();
 
@@ -68,6 +71,33 @@ h3Router.get("/sea-route", (req: Request, res: Response) => {
     return res.json({ coordinates });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Sea route failed";
+    return res.status(500).json({ error: message });
+  }
+});
+
+/** Land path that avoids cutting across open water (Google or land-grid A*). */
+h3Router.get("/land-route", async (req: Request, res: Response) => {
+  const parsed = landRouteQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Validation failed",
+      details: parsed.error.flatten().fieldErrors,
+    });
+  }
+
+  const { from_lat, from_lng, to_lat, to_lng } = parsed.data;
+  try {
+    const route = await computeLandRoute(
+      { lat: from_lat, lng: from_lng },
+      { lat: to_lat, lng: to_lng }
+    );
+    return res.json({
+      coordinates: route.coordinates ?? null,
+      distance_km: route.distance_km,
+      source: route.source,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Land route failed";
     return res.status(500).json({ error: message });
   }
 });

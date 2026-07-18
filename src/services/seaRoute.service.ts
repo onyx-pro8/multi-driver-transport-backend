@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 import {
   findNearestWater,
-  isOnLand,
+  isOnLandCoarse,
   segmentCrossesLand,
   type LatLng,
 } from "./landMask.service";
@@ -60,7 +60,7 @@ function searouteMiddle(departure: LatLng, arrival: LatLng): LatLng[] | null {
 
 /** Keep only open-water nodes from the marine network (coarse land mask). */
 function offshoreWaypoints(points: LatLng[]): LatLng[] {
-  return points.filter((p) => !isOnLand(p));
+  return points.filter((p) => !isOnLandCoarse(p));
 }
 
 /** Rebuild a polyline so every segment is water-safe (A* detour when needed). */
@@ -111,10 +111,10 @@ export function computeSeaRoute(
   core = repairLandCrossings(core);
   if (core.length < 2) return null;
 
-  const depAnchor = isOnLand(departure)
+  const depAnchor = isOnLandCoarse(departure)
     ? findNearestWater(departure) ?? findNearestWater(departure, 4.0, 0.04)
     : departure;
-  const arrAnchor = isOnLand(arrival)
+  const arrAnchor = isOnLandCoarse(arrival)
     ? findNearestWater(arrival) ?? findNearestWater(arrival, 4.0, 0.04)
     : arrival;
 

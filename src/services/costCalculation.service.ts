@@ -90,17 +90,34 @@ export function calculateSegmentDistanceH3(
   ) {
     return { distance_h3_cells: null, distance_km: null };
   }
+  const greatCircleKm = haversineKm(fromLat, fromLng, toLat, toLng);
   try {
-    const fromCell = latLngToCell(fromLat, fromLng, resolution);
-    const toCell = latLngToCell(toLat, toLng, resolution);
+    // Coarse zone resolutions collapse nearby points into one cell (0 km).
+    // Cap at res 9: finer cells massively over-count when multiplied by a
+    // coarse km-per-cell factor (ORDER_H3_RESOLUTION is 15 for order pins).
+    const safeRes = Math.min(9, Math.max(resolution, 8));
+    const fromCell = latLngToCell(fromLat, fromLng, safeRes);
+    const toCell = latLngToCell(toLat, toLng, safeRes);
     const cells = gridDistance(fromCell, toCell);
-    const kmPerCell = resolution <= 4 ? 22 : resolution <= 6 ? 3.2 : resolution <= 8 ? 0.46 : 0.17;
+    const kmPerCell = safeRes <= 8 ? 0.46 : 0.17;
+    const h3Km = cells * kmPerCell;
+    // Floor at great-circle; also cap absurd H3 blow-ups (pentagon / res mismatch).
+    let distanceKm = h3Km;
+    if (greatCircleKm != null) {
+      distanceKm = Math.max(h3Km, greatCircleKm);
+      if (distanceKm > greatCircleKm * 4 + 1) {
+        distanceKm = Math.max(greatCircleKm, greatCircleKm * 1.15);
+      }
+    }
     return {
       distance_h3_cells: cells,
-      distance_km: roundMoney(cells * kmPerCell),
+      distance_km: roundMoney(distanceKm),
     };
   } catch {
-    return { distance_h3_cells: null, distance_km: null };
+    return {
+      distance_h3_cells: null,
+      distance_km: greatCircleKm,
+    };
   }
 }
 

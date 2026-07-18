@@ -1,9 +1,11 @@
 import { AStarFinder, Grid } from "pathfinding";
 import type { LatLng } from "./landMask.service";
 import {
-  clipCoarseLandToBbox,
+  clipLandToBbox,
+  findNearestLand,
+  isOnLand,
   isOnLandAmong,
-  segmentCrossesLand,
+  segmentCrossesWater,
 } from "./landMask.service";
 
 const finder = new AStarFinder({
@@ -22,9 +24,11 @@ function bboxAround(a: LatLng, b: LatLng, padDeg: number) {
 
 function chooseStepDeg(a: LatLng, b: LatLng): number {
   const dist = Math.hypot(a.lat - b.lat, a.lng - b.lng);
-  if (dist < 0.3) return 0.02;
-  if (dist < 1.5) return 0.04;
-  return 0.08;
+  // Short harbour hops need fine cells to follow narrow spits/causeways
+  // (e.g. Palisadoes ~400 m wide). Longer legs coarsen to bound the grid.
+  if (dist < 0.3) return 0.004;
+  if (dist < 1.5) return 0.02;
+  return 0.05;
 }
 
 function latLngToGrid(
@@ -53,19 +57,26 @@ function gridToLatLng(
 }
 
 /**
- * A* over a local water-only grid. Land cells are blocked; open sea and
- * coarse estuaries (wider than ~110m land resolution) remain walkable.
+ * A* over a local land-only grid. Water cells are blocked so land legs cannot
+ * cut across harbours / open sea.
+ *
+ * Endpoints that sit offshore (e.g. a thin coastal spit missing from the
+ * coarse land mask) are snapped to nearest land — the returned path stays on
+ * land and does not stitch a water chord back to the offshore point.
  */
-export function routeOnWaterGrid(start: LatLng, end: LatLng): LatLng[] | null {
-  const pad = 0.35;
-  const bbox = bboxAround(start, end, pad);
-  const step = chooseStepDeg(start, end);
+export function routeOnLandGrid(start: LatLng, end: LatLng): LatLng[] | null {
+  const pad = 0.4;
+  const startSnap = isOnLand(start) ? start : findNearestLand(start) ?? start;
+  const endSnap = isOnLand(end) ? end : findNearestLand(end) ?? end;
+
+  const bbox = bboxAround(startSnap, endSnap, pad);
+  const step = chooseStepDeg(startSnap, endSnap);
   const cols = Math.max(8, Math.ceil((bbox.maxLng - bbox.minLng) / step) + 1);
   const rows = Math.max(8, Math.ceil((bbox.maxLat - bbox.minLat) / step) + 1);
 
-  if (cols * rows > 250_000) return null;
+  if (cols * rows > 80_000) return null;
 
-  const candidates = clipCoarseLandToBbox([
+  const candidates = clipLandToBbox([
     bbox.minLng,
     bbox.minLat,
     bbox.maxLng,
@@ -76,30 +87,43 @@ export function routeOnWaterGrid(start: LatLng, end: LatLng): LatLng[] | null {
   for (let y = 0; y < rows; y++) {
     for (let x = 0; x < cols; x++) {
       const cell = gridToLatLng(x, y, bbox, step);
-      const walkable = !isOnLandAmong(cell, candidates);
-      grid.setWalkableAt(x, y, walkable);
+      grid.setWalkableAt(x, y, isOnLandAmong(cell, candidates));
     }
   }
 
-  let startCell = latLngToGrid(start, bbox, step, cols, rows);
-  let endCell = latLngToGrid(end, bbox, step, cols, rows);
+  let startCell = latLngToGrid(startSnap, bbox, step, cols, rows);
+  let endCell = latLngToGrid(endSnap, bbox, step, cols, rows);
 
   if (!startCell || !grid.isWalkableAt(startCell.x, startCell.y)) {
-    startCell = findNearestWalkable(start, bbox, step, cols, rows, grid) ?? startCell;
+    startCell =
+      findNearestWalkable(startSnap, bbox, step, cols, rows, grid) ?? startCell;
   }
   if (!endCell || !grid.isWalkableAt(endCell.x, endCell.y)) {
-    endCell = findNearestWalkable(end, bbox, step, cols, rows, grid) ?? endCell;
+    endCell =
+      findNearestWalkable(endSnap, bbox, step, cols, rows, grid) ?? endCell;
   }
   if (!startCell || !endCell) return null;
 
-  const path = finder.findPath(startCell.x, startCell.y, endCell.x, endCell.y, grid.clone());
+  const path = finder.findPath(
+    startCell.x,
+    startCell.y,
+    endCell.x,
+    endCell.y,
+    grid.clone()
+  );
   if (!path.length) return null;
+
+  // Single grid cell: still emit both snapped endpoints.
+  if (path.length === 1) {
+    return dedupeLatLngs([startSnap, endSnap]);
+  }
 
   const coords = path.map((cell: [number, number]) =>
     gridToLatLng(cell[0], cell[1], bbox, step)
   );
-  coords[0] = start;
-  coords[coords.length - 1] = end;
+  // Keep snapped land endpoints — do not force offshore hubs back onto the path.
+  coords[0] = startSnap;
+  coords[coords.length - 1] = endSnap;
   return dedupeLatLngs(coords);
 }
 
@@ -129,60 +153,28 @@ function findNearestWalkable(
 }
 
 /**
- * Connect two points without crossing land. Uses a direct segment when safe,
- * otherwise A* on a local water grid.
+ * Connect two land points without crossing open water. Uses a direct segment
+ * when safe, otherwise A* on a local land grid.
  */
-export function routeWaterSegment(from: LatLng, to: LatLng): LatLng[] | null {
-  if (!segmentCrossesLand(from, to)) {
+export function routeLandSegment(from: LatLng, to: LatLng): LatLng[] | null {
+  if (!segmentCrossesWater(from, to)) {
     return dedupeLatLngs([from, to]);
   }
-  return routeOnWaterGrid(from, to);
+  return routeOnLandGrid(from, to);
 }
 
 function dedupeLatLngs(points: LatLng[]): LatLng[] {
   const out: LatLng[] = [];
   for (const p of points) {
     const prev = out[out.length - 1];
-    if (prev && Math.abs(prev.lat - p.lat) < 1e-6 && Math.abs(prev.lng - p.lng) < 1e-6) {
+    if (
+      prev &&
+      Math.abs(prev.lat - p.lat) < 1e-6 &&
+      Math.abs(prev.lng - p.lng) < 1e-6
+    ) {
       continue;
     }
     out.push(p);
-  }
-  return out;
-}
-
-/** Merge multiple path segments into one coordinate list. */
-export function mergePaths(segments: LatLng[][]): LatLng[] {
-  const out: LatLng[] = [];
-  for (const seg of segments) {
-    for (const p of seg) {
-      const prev = out[out.length - 1];
-      if (prev && Math.abs(prev.lat - p.lat) < 1e-5 && Math.abs(prev.lng - p.lng) < 1e-5) {
-        continue;
-      }
-      out.push(p);
-    }
-  }
-  return out;
-}
-
-/** Ensure every consecutive pair in the path does not cross land. */
-export function repairLandCrossings(path: LatLng[]): LatLng[] {
-  if (path.length < 2) return path;
-  const out: LatLng[] = [path[0]];
-  for (let i = 1; i < path.length; i++) {
-    const from = out[out.length - 1];
-    const to = path[i];
-    if (!segmentCrossesLand(from, to)) {
-      out.push(to);
-      continue;
-    }
-    const detour = routeOnWaterGrid(from, to);
-    if (!detour || detour.length < 2) {
-      out.push(to);
-      continue;
-    }
-    for (let j = 1; j < detour.length; j++) out.push(detour[j]);
   }
   return out;
 }
