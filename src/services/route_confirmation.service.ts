@@ -247,8 +247,8 @@ export async function selectRoute(
       );
     }
     assertRoutePurposeAccess(selectionPurpose, ctx, senderId, receiverId);
-  } else if (ctx.role !== "admin" && ctx.userId !== receiverId) {
-    throw new RouteConfirmationError("Only the receiver can select the route", 403);
+  } else if (ctx.role !== "admin" && ctx.userId !== senderId) {
+    throw new RouteConfirmationError("Only the sender can select the route", 403);
   }
 
   await calculateRouteCost(routeId, ctx);
@@ -256,6 +256,39 @@ export async function selectRoute(
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
+    // Supersede confirmations on any previously selected route for this purpose
+    // so transporters only act on the newly chosen route.
+    await client.query(
+      `UPDATE segment_confirmations sc
+       SET status = 'rejected',
+           rejection_reason = COALESCE(sc.rejection_reason, 'Route superseded by a new selection'),
+           confirmed_at = COALESCE(sc.confirmed_at, NOW())
+       FROM order_routes r
+       WHERE r.id = sc.route_id
+         AND r.order_id = $1
+         AND sc.route_id <> $2
+         AND sc.status <> 'rejected'
+         AND (
+           ($3 = 'standard' AND (r.route_purpose IS NULL OR r.route_purpose = 'standard'))
+           OR r.route_purpose = $3
+         )`,
+      [orderId, routeId, selectionPurpose],
+    );
+    await client.query(
+      `UPDATE route_confirmation_requests rcr
+       SET status = 'rejected', responded_at = COALESCE(rcr.responded_at, NOW())
+       FROM order_routes r
+       WHERE r.id = rcr.route_id
+         AND r.order_id = $1
+         AND rcr.route_id <> $2
+         AND rcr.status = 'sent'
+         AND (
+           ($3 = 'standard' AND (r.route_purpose IS NULL OR r.route_purpose = 'standard'))
+           OR r.route_purpose = $3
+         )`,
+      [orderId, routeId, selectionPurpose],
+    );
 
     await client.query(
       `INSERT INTO route_selections
@@ -889,6 +922,7 @@ export async function listTransporterConfirmations(
             o.route_schedule_at,
             r.is_complete AS route_is_complete,
             rs.status AS route_selection_status,
+            (rs.selected_route_id IS NOT NULL) AS is_current_selection,
             (
               SELECT COUNT(*)::int
               FROM route_segment_costs rsc2
@@ -994,6 +1028,7 @@ export async function listTransporterConfirmations(
         row.route_selection_status != null
           ? (String(row.route_selection_status) as RouteSelectionStatus)
           : null,
+      is_current_selection: Boolean(row.is_current_selection),
       order_tracking_status: isTrackingStatus(row.order_tracking_status)
         ? row.order_tracking_status
         : "PICKUP_AVAILABLE",

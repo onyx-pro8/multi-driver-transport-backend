@@ -176,6 +176,15 @@ export async function getTransporterOrders(
   const byOrder = new Map<number, TransporterOrderViewItem>();
 
   for (const item of confirmations) {
+    // Active tab should only show the currently selected route — not rejected
+    // or superseded confirmations left over after route reselection.
+    const isActiveRoute =
+      item.is_current_selection &&
+      item.route_selection_status != null &&
+      item.route_selection_status !== "rejected" &&
+      item.status !== "rejected";
+    if (!isActiveRoute) continue;
+
     if (!byOrder.has(item.order_id)) {
       const orderResult = await pool.query(
         `SELECT status, tracking_status, sender_address, destination_address FROM orders WHERE id = $1`,
