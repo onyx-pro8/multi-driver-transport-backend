@@ -671,12 +671,19 @@ const DEFAULT_EXTRA_HOPS = 2;
 
 /** Safety caps so a dense graph can't blow up the enumeration. */
 const MAX_PREVIEW_CHAINS = 25;
+const MAX_ENUMERATED_CANDIDATE_CHAINS = 200;
 const MAX_ENUMERATION_STEPS = 200_000;
 
 interface EnumeratedChains {
   chains: OrderDraftChain[];
   usedConnectionIds: Set<number>;
   zoneIds: Set<number>;
+}
+
+interface RankedChain {
+  chain: OrderDraftChain;
+  estimated_cost: number;
+  air_zone_count: number;
 }
 
 /**
@@ -689,6 +696,147 @@ function hubTerminalOf(conn: ConnectionRow, zoneId: number): HubRole | null {
   if (conn.zone_a_id === zoneId) return conn.hub_role_a;
   if (conn.zone_b_id === zoneId) return conn.hub_role_b;
   return null;
+}
+
+function zonePoint(z: ZoneMeta, kind: "departure" | "arrival"): { lat: number; lng: number } | null {
+  const hub = kind === "departure" ? z.departure_hub : z.arrival_hub;
+  if (hub && Number.isFinite(hub.lat) && Number.isFinite(hub.lng)) {
+    return { lat: hub.lat, lng: hub.lng };
+  }
+  return null;
+}
+
+function transferPointFromCells(cells: readonly string[]): { lat: number; lng: number } | null {
+  let lat = 0;
+  let lng = 0;
+  let count = 0;
+  for (const cell of cells) {
+    if (!isValidCell(cell)) continue;
+    try {
+      const [cellLat, cellLng] = cellToLatLng(cell);
+      if (Number.isFinite(cellLat) && Number.isFinite(cellLng)) {
+        lat += cellLat;
+        lng += cellLng;
+        count++;
+      }
+    } catch {
+      /* skip invalid cell */
+    }
+  }
+  if (count === 0) return null;
+  return { lat: lat / count, lng: lng / count };
+}
+
+function midpoint(
+  a: { lat: number; lng: number } | null,
+  b: { lat: number; lng: number } | null
+): { lat: number; lng: number } | null {
+  if (!a || !b) return a ?? b ?? null;
+  return { lat: (a.lat + b.lat) / 2, lng: (a.lng + b.lng) / 2 };
+}
+
+function estimatedHoursForMode(mode: string | null | undefined, km: number): number {
+  const normalized = (mode ?? "land").toLowerCase();
+  const speedKmPerHour =
+    normalized === "air" ? 800 : normalized === "sea" ? 35 : 60;
+  return km / speedKmPerHour;
+}
+
+function estimateChainRanking(
+  chain: OrderDraftChain,
+  zoneById: Map<number, ZoneMeta>,
+  connectionsById: Map<number, ConnectionRow>,
+  zoneCentroids: Map<number, { lat: number; lng: number }>,
+  endpoints: {
+    source: { lat: number; lng: number };
+    destination: { lat: number; lng: number };
+  }
+): RankedChain {
+  const zoneIds = chain.zone_ids;
+  const connectionIds = chain.connection_ids;
+  const transferAt = (idx: number): { lat: number; lng: number } | null => {
+    const connectionId = connectionIds[idx];
+    const conn = connectionId != null ? connectionsById.get(connectionId) : null;
+    const from = zoneCentroids.get(zoneIds[idx]) ?? null;
+    const to = zoneCentroids.get(zoneIds[idx + 1]) ?? null;
+    return transferPointFromCells(conn?.transfer_cells ?? []) ?? midpoint(from, to);
+  };
+
+  let estimatedCost = 0;
+  let airZoneCount = 0;
+  for (let i = 0; i < zoneIds.length; i++) {
+    const zone = zoneById.get(zoneIds[i]);
+    if (!zone) continue;
+    const mode = (zone.transport_mode ?? "land").toLowerCase();
+    if (mode === "air") airZoneCount += 1;
+
+    const fallbackCenter = zoneCentroids.get(zone.id) ?? null;
+    const entry =
+      i === 0
+        ? endpoints.source
+        : transferAt(i - 1) ??
+          zonePoint(zone, mode === "air" || mode === "sea" ? "departure" : "arrival") ??
+          fallbackCenter;
+    const exit =
+      i === zoneIds.length - 1
+        ? endpoints.destination
+        : transferAt(i) ??
+          zonePoint(zone, mode === "air" || mode === "sea" ? "arrival" : "departure") ??
+          fallbackCenter;
+
+    let km = 0;
+    if ((mode === "air" || mode === "sea") && zone.departure_hub && zone.arrival_hub) {
+      km = haversineKm(
+        zone.departure_hub.lat,
+        zone.departure_hub.lng,
+        zone.arrival_hub.lat,
+        zone.arrival_hub.lng
+      );
+    } else if (entry && exit) {
+      km = haversineKm(entry.lat, entry.lng, exit.lat, exit.lng);
+    }
+
+    const hours = estimatedHoursForMode(mode, km);
+    estimatedCost += Math.max(0, zone.base_fee ?? 0);
+    estimatedCost += Math.max(0, zone.cost_per_km ?? 0) * km;
+    estimatedCost += Math.max(0, zone.cost_per_hour ?? 0) * hours;
+  }
+
+  return {
+    chain,
+    estimated_cost: Math.round(estimatedCost * 100) / 100,
+    air_zone_count: airZoneCount,
+  };
+}
+
+export function rankPreviewChains(
+  chains: OrderDraftChain[],
+  zoneById: Map<number, ZoneMeta>,
+  connectionsById: Map<number, ConnectionRow>,
+  zoneCentroids: Map<number, { lat: number; lng: number }>,
+  endpoints: {
+    source: { lat: number; lng: number };
+    destination: { lat: number; lng: number };
+  }
+): OrderDraftChain[] {
+  return chains
+    .map((chain) =>
+      estimateChainRanking(chain, zoneById, connectionsById, zoneCentroids, endpoints)
+    )
+    .sort((a, b) => {
+      if (a.estimated_cost !== b.estimated_cost) {
+        return a.estimated_cost - b.estimated_cost;
+      }
+      if (a.chain.hops !== b.chain.hops) {
+        return a.chain.hops - b.chain.hops;
+      }
+      if (a.air_zone_count !== b.air_zone_count) {
+        return b.air_zone_count - a.air_zone_count;
+      }
+      return a.chain.zone_ids.length - b.chain.zone_ids.length;
+    })
+    .slice(0, MAX_PREVIEW_CHAINS)
+    .map((item) => item.chain);
 }
 
 /**
@@ -742,7 +890,7 @@ function enumerateChains(
   // `entryConn` is the connection the path used to arrive at `current` (undefined
   // for the pickup zone where the path starts).
   function dfs(current: number, entryConn: ConnectionRow | undefined): void {
-    if (chains.length >= MAX_PREVIEW_CHAINS || steps >= MAX_ENUMERATION_STEPS) return;
+    if (chains.length >= MAX_ENUMERATED_CANDIDATE_CHAINS || steps >= MAX_ENUMERATION_STEPS) return;
     steps++;
 
     // Destinations are terminal — stop extending so we don't manufacture
@@ -783,7 +931,7 @@ function enumerateChains(
       zonePath.pop();
       visited.delete(neighbour);
 
-      if (chains.length >= MAX_PREVIEW_CHAINS || steps >= MAX_ENUMERATION_STEPS) return;
+      if (chains.length >= MAX_ENUMERATED_CANDIDATE_CHAINS || steps >= MAX_ENUMERATION_STEPS) return;
     }
   }
 
@@ -794,11 +942,9 @@ function enumerateChains(
     dfs(p, undefined);
     zonePath.pop();
     visited.delete(p);
-    if (chains.length >= MAX_PREVIEW_CHAINS) break;
+    if (chains.length >= MAX_ENUMERATED_CANDIDATE_CHAINS) break;
   }
 
-  // Shortest first, then fewer zones, so the UI lists the cleanest routes up top.
-  chains.sort((a, b) => a.hops - b.hops || a.zone_ids.length - b.zone_ids.length);
   return { chains, usedConnectionIds, zoneIds };
 }
 
@@ -1302,6 +1448,7 @@ export async function previewOrderZoneConnectionsByCoordinates(
     connections,
     new Set(zoneById.keys()),
   );
+  const connectionsById = new Map(connections.map((c) => [c.id, c]));
 
   const pickupZones = pickZones(pickupIds, zoneById);
   const destinationZones = pickZones(destIds, zoneById);
@@ -1317,8 +1464,24 @@ export async function previewOrderZoneConnectionsByCoordinates(
     maxDepth,
     extraHops
   );
-  const chains = enumerated.chains;
-  const usedConnectionIds = enumerated.usedConnectionIds;
+  const candidateZoneIds = Array.from(enumerated.zoneIds);
+  const zoneCentroids = await loadZoneCentroids(candidateZoneIds);
+  const chains = rankPreviewChains(
+    enumerated.chains,
+    zoneById,
+    connectionsById,
+    zoneCentroids,
+    {
+      source: { lat: input.source_lat, lng: input.source_lng },
+      destination: { lat: input.destination_lat, lng: input.destination_lng },
+    }
+  );
+  const usedConnectionIds = new Set<number>();
+  const rankedZoneIds = new Set<number>();
+  for (const chain of chains) {
+    chain.connection_ids.forEach((id) => usedConnectionIds.add(id));
+    chain.zone_ids.forEach((id) => rankedZoneIds.add(id));
+  }
   const isConnected = chains.length > 0;
 
   // Milestone 4 — when there is no complete route but both ends have a
@@ -1346,7 +1509,7 @@ export async function previewOrderZoneConnectionsByCoordinates(
   const surfacedIds = new Set<number>();
   pickupIds.forEach((id) => surfacedIds.add(id));
   destIds.forEach((id) => surfacedIds.add(id));
-  enumerated.zoneIds.forEach((id) => surfacedIds.add(id));
+  rankedZoneIds.forEach((id) => surfacedIds.add(id));
   if (gap) {
     gap.pickup_chain?.zone_ids.forEach((id) => surfacedIds.add(id));
     gap.destination_chain?.zone_ids.forEach((id) => surfacedIds.add(id));

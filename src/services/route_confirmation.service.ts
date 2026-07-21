@@ -900,6 +900,7 @@ export async function listTransporterConfirmations(
             rsc.handoff_role,
             rsc.from_node_id,
             rsc.to_node_id,
+            su.full_name AS sender_name,
             o.sender_address,
             o.destination_address,
             o.tracking_status AS order_tracking_status,
@@ -946,6 +947,7 @@ export async function listTransporterConfirmations(
      JOIN route_segment_costs rsc ON rsc.id = sc.segment_id
      JOIN orders o ON o.id = r.order_id
      JOIN users ru ON ru.id = o.receiver_user_id
+     JOIN users su ON su.id = o.sender_user_id
      LEFT JOIN route_selections rs ON rs.order_id = r.order_id AND rs.selected_route_id = r.id
      LEFT JOIN route_confirmation_requests rcr ON rcr.segment_id = sc.segment_id
      WHERE sc.transporter_id = $1
@@ -957,6 +959,7 @@ export async function listTransporterConfirmations(
     number,
     Awaited<ReturnType<typeof getRouteCostSummary>> | null
   >();
+  const driverNameCache = new Map<number, string | null>();
   const scheduleInactiveCache = new Map<number, ScheduleInactiveZoneSummary[]>();
   const zoneScheduleCache = new Map<number, { active: boolean | null; summary: string | null; inactive_reason: string | null }>();
 
@@ -979,6 +982,21 @@ export async function listTransporterConfirmations(
     const seg = summary?.segments.find((s) => s.segment_id === Number(row.segment_id));
     const zoneId = seg?.zone_id ?? null;
 
+    let driver_name: string | null = null;
+    if (zoneId != null) {
+      if (driverNameCache.has(zoneId)) {
+        driver_name = driverNameCache.get(zoneId) ?? null;
+      } else {
+        const driverResult = await pool.query(
+          `SELECT driver_name FROM driver_zones WHERE id = $1`,
+          [zoneId]
+        );
+        const name = driverResult.rows[0]?.driver_name;
+        driver_name = name != null ? String(name) : null;
+        driverNameCache.set(zoneId, driver_name);
+      }
+    }
+
     if (!scheduleInactiveCache.has(orderId)) {
       scheduleInactiveCache.set(
         orderId,
@@ -1000,6 +1018,9 @@ export async function listTransporterConfirmations(
       order_id: Number(row.order_id),
       segment_id: Number(row.segment_id),
       segment_index: Number(row.segment_index),
+      transporter_id: Number(row.transporter_id),
+      transporter_name: seg?.transporter_name ?? `Transporter #${Number(row.transporter_id)}`,
+      driver_name,
       leg_phase:
         row.leg_phase === "payment" || row.leg_phase === "goods"
           ? row.leg_phase
@@ -1021,6 +1042,9 @@ export async function listTransporterConfirmations(
       zone_ids: parseJsonIntArray(row.zone_ids),
       connection_ids: parseJsonIntArray(row.connection_ids),
       transport_method: seg?.transport_method ?? null,
+      sender_name: row.sender_name != null ? String(row.sender_name) : null,
+      receiver_name: row.receiver_name != null ? String(row.receiver_name) : null,
+      transporters: summary?.transporters ?? [],
       sender_address: String(row.sender_address),
       destination_address: String(row.destination_address),
       sent_at: row.sent_at ? new Date(row.sent_at).toISOString() : new Date().toISOString(),

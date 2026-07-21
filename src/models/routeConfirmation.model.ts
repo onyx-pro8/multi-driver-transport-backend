@@ -112,6 +112,9 @@ export interface TransporterConfirmationItem {
   order_id: number;
   segment_id: number;
   segment_index: number;
+  transporter_id: number;
+  transporter_name: string;
+  driver_name: string | null;
   leg_phase?: PffLegPhase | null;
   handoff_role?: import("./routeCost.model").PffHandoffRole | null;
   from_label: string;
@@ -124,6 +127,9 @@ export interface TransporterConfirmationItem {
   zone_ids: number[];
   connection_ids: number[];
   transport_method: string | null;
+  sender_name: string | null;
+  receiver_name: string | null;
+  transporters: string[];
   sender_address: string;
   destination_address: string;
   sent_at: string;
