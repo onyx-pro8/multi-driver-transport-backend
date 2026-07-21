@@ -861,15 +861,21 @@ export async function listTransporterConfirmations(
   if (ctx.role !== "driver" && ctx.role !== "admin") {
     throw new RouteConfirmationError("Forbidden", 403);
   }
-  const transporterId = ctx.userId;
+
+  const params: unknown[] = [];
+  let transporterFilter = "";
+  if (ctx.role === "driver") {
+    params.push(ctx.userId);
+    transporterFilter = `WHERE sc.transporter_id = $${params.length}`;
+  }
 
   const initialResult = await pool.query(
     `SELECT DISTINCT o.id AS order_id, o.payment_method, o.pickup_ready_at, o.tracking_status
      FROM segment_confirmations sc
      JOIN order_routes r ON r.id = sc.route_id
      JOIN orders o ON o.id = r.order_id
-     WHERE sc.transporter_id = $1`,
-    [transporterId]
+     ${transporterFilter}`,
+    params
   );
   const syncTargets = initialResult.rows.filter(
     (row) =>
@@ -887,6 +893,7 @@ export async function listTransporterConfirmations(
     `SELECT sc.id AS confirmation_id,
             sc.route_id,
             sc.segment_id,
+            sc.transporter_id,
             sc.status,
             sc.leg_status,
             sc.rejection_reason,
@@ -950,9 +957,9 @@ export async function listTransporterConfirmations(
      JOIN users su ON su.id = o.sender_user_id
      LEFT JOIN route_selections rs ON rs.order_id = r.order_id AND rs.selected_route_id = r.id
      LEFT JOIN route_confirmation_requests rcr ON rcr.segment_id = sc.segment_id
-     WHERE sc.transporter_id = $1
+     ${transporterFilter}
      ORDER BY sc.created_at DESC`,
-    [transporterId]
+    params
   );
 
   const summaryCache = new Map<
