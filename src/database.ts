@@ -757,6 +757,12 @@ export async function ensureSchema(): Promise<void> {
     await client.query(
       `ALTER TABLE orders ADD COLUMN IF NOT EXISTS route_schedule_at TIMESTAMPTZ;`
     );
+    await client.query(
+      `ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_ready_at TIMESTAMPTZ;`
+    );
+    await client.query(
+      `ALTER TABLE orders ADD COLUMN IF NOT EXISTS goods_ready_at TIMESTAMPTZ;`
+    );
     // Reset rows that inherited the old PICKUP_AVAILABLE default before pick ready / delivery.
     await client.query(
       `UPDATE orders
@@ -788,12 +794,6 @@ export async function ensureSchema(): Promise<void> {
       );
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_order_status_history_order ON order_status_history (order_id);`);
-    await client.query(
-      `ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_ready_at TIMESTAMPTZ;`
-    );
-    await client.query(
-      `ALTER TABLE orders ADD COLUMN IF NOT EXISTS goods_ready_at TIMESTAMPTZ;`
-    );
     await client.query(
       `ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS leg_phase TEXT;`
     );
