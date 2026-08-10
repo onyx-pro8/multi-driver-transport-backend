@@ -78,6 +78,47 @@ export interface AuthResponse {
   tokens: TokenPair;
 }
 
+/**
+ * Ensure a bootstrap admin exists from ADMIN_EMAIL + ADMIN_PASSWORD.
+ * Creates the user when missing; syncs password/role when the email already exists.
+ * No-op if either env var is unset.
+ */
+export async function ensureAdminUser(): Promise<void> {
+  const email = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  const password = process.env.ADMIN_PASSWORD || "";
+  if (!email || !password) {
+    console.warn(
+      "[auth] ADMIN_EMAIL / ADMIN_PASSWORD not set — skipping admin bootstrap"
+    );
+    return;
+  }
+
+  const hashed = await hashPassword(password);
+  const fullName = (process.env.ADMIN_FULL_NAME || "Admin").trim() || "Admin";
+  const existing = await findUserByEmail(email);
+
+  if (!existing) {
+    await pool.query(
+      `INSERT INTO users (full_name, company_name, email, hashed_password, role, phone, address)
+       VALUES ($1, '', $2, $3, 'admin', '', '')`,
+      [fullName, email, hashed]
+    );
+    console.log(`[auth] bootstrap admin created: ${email}`);
+    return;
+  }
+
+  await pool.query(
+    `UPDATE users
+     SET hashed_password = $1,
+         role = 'admin',
+         is_active = TRUE,
+         updated_at = NOW()
+     WHERE id = $2`,
+    [hashed, existing.id]
+  );
+  console.log(`[auth] bootstrap admin synced: ${email}`);
+}
+
 export async function registerUser(input: RegisterRequest): Promise<AuthResponse> {
   const existing = await findUserByEmail(input.email);
   if (existing) throw new AuthError("Email already in use", 409);

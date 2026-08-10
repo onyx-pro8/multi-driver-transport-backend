@@ -2,6 +2,7 @@ import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { ensureSchema } from "./database";
+import { ensureAdminUser } from "./services/auth.service";
 import { authRouter } from "./routes/auth.routes";
 import { dashboardRouter } from "./routes/dashboard.routes";
 import { h3Router } from "./routes/h3.routes";
@@ -114,6 +115,7 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 async function bootstrap() {
   await ensureSchema();
+  await ensureAdminUser();
   // Warm the land-polygon mask used by sea routing so the first sea-route
   // request doesn't pay the file-load cost mid-request.
   try {
