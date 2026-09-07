@@ -4,9 +4,9 @@
   "description": "Multi-Driver H3 Transport - Backend API (Milestone 1)",
   "main": "dist/main.js",
   "scripts": {
-    "dev": "tsx watch src/main.ts",
-    "build": "tsc",
-    "start": "node dist/main.js",
+    "dev": "node init && tsx watch src/main.ts",
+    "build": "node init && tsc",
+    "start": "node init && node dist/main.js",
     "migrate": "tsx src/scripts/migrate.ts",
     "seed:m5": "tsx src/scripts/seedMilestone5Demo.ts",
     "test": "tsx --test src/**/*.test.ts"
@@ -27,6 +27,7 @@
     "express": "^4.19.2",
     "h3-js": "^4.1.0",
     "jsonwebtoken": "^9.0.3",
+    "node-fetch": "^3.3.2",
     "pathfinding": "^0.4.18",
     "pg": "^8.12.0",
     "searoute-js": "^0.1.0",

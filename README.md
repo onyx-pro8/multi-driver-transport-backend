@@ -5,7 +5,7 @@ Node.js + TypeScript + Express API with PostgreSQL and `h3-js`.
 ## Prerequisites
 
 - Node.js 18+
-- PostgreSQL 14+ (local install, no Docker required)
+- PostgreSQL 14+
 
 ## Database setup
 
